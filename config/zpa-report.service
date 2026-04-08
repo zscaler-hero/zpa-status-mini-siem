@@ -1,0 +1,10 @@
+[Unit]
+Description=ZPA Status Mini-SIEM — daily report generator
+After=network.target
+
+[Service]
+Type=oneshot
+# Force logrotate first to ensure yesterday's log is rotated
+ExecStartPre=/usr/sbin/logrotate -f /etc/logrotate.d/zpa
+ExecStart=/opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py
+WorkingDirectory=/opt/zpa-siem

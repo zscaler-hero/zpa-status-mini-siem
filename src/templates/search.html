@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Search — ZPA Mini-SIEM{% endblock %}
+{% block content %}
+<h1>Search Sessions</h1>
+
+<div class="card">
+    <form class="search-form" action="/search" method="GET">
+        <input type="text" name="q" placeholder="Search by username..." value="{{ query or '' }}" autofocus>
+        <button type="submit">Search</button>
+    </form>
+</div>
+
+{% if query %}
+<div class="card">
+    <p style="margin-bottom: 0.8rem; color: #666; font-size: 0.85rem;">
+        {{ results|length }} sessions found for "{{ query }}"
+    </p>
+    {% if results %}
+    <div class="overflow-x">
+    <table>
+        <thead>
+            <tr>
+                <th>Username</th><th>Date</th><th>Start</th><th>End</th><th>Duration</th>
+                <th>Public IP</th><th>City</th><th>Country</th>
+                <th>Device</th><th>Platform</th><th>Version</th>
+                <th>Trusted Net</th><th>Rx</th><th>Tx</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in results %}
+            <tr{% if s.session_end == "In corso" %} class="active"{% endif %}>
+                <td>{{ s.username }}</td>
+                <td><a href="/report/{{ s.date }}">{{ s.date }}</a></td>
+                <td>{{ s.session_start }}</td><td>{{ s.session_end }}</td><td>{{ s.duration }}</td>
+                <td>{{ s.public_ip }}</td><td>{{ s.city }}</td><td>{{ s.country }}</td>
+                <td>{{ s.device }}</td><td>{{ s.platform }}</td><td>{{ s.client_version }}</td>
+                <td>{{ s.trusted_network }}</td><td>{{ s.bytes_rx }}</td><td>{{ s.bytes_tx }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    </div>
+    {% else %}
+    <p class="empty">No sessions found for "{{ query }}".</p>
+    {% endif %}
+</div>
+{% endif %}
+{% endblock %}

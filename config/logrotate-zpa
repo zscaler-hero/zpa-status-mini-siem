@@ -1,0 +1,20 @@
+# /etc/logrotate.d/zpa
+# Daily rotation for ZPA syslog files.
+# Keeps 30 days: yesterday uncompressed (for report_generator),
+# older days gzipped, beyond 30 days deleted automatically.
+
+/var/log/zpa/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    dateext
+    dateformat -%Y%m%d
+    create 0640 root root
+    sharedscripts
+    postrotate
+        /usr/bin/systemctl reload rsyslog > /dev/null 2>&1 || true
+    endscript
+}

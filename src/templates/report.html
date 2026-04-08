@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Report {{ date }} — ZPA Mini-SIEM{% endblock %}
+{% block content %}
+<div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem;">
+    <h1>Report — {{ date }}</h1>
+    <a href="/report/{{ date }}/download" class="btn">Download Excel</a>
+</div>
+
+<div class="card">
+    <p style="margin-bottom: 0.8rem; color: #666; font-size: 0.85rem;">
+        {{ sessions|length }} sessions | Timezone: {{ timezone }} | Generated: {{ generated_at }}
+    </p>
+    <div class="overflow-x">
+    <table id="report-table">
+        <thead>
+            <tr>
+                <th onclick="sortTable(0)">Username</th>
+                <th onclick="sortTable(1)">Date</th>
+                <th onclick="sortTable(2)">Start</th>
+                <th onclick="sortTable(3)">End</th>
+                <th onclick="sortTable(4)">Duration</th>
+                <th onclick="sortTable(5)">Public IP</th>
+                <th onclick="sortTable(6)">Private IP</th>
+                <th onclick="sortTable(7)">City</th>
+                <th onclick="sortTable(8)">Country</th>
+                <th onclick="sortTable(9)">Device</th>
+                <th onclick="sortTable(10)">Platform</th>
+                <th onclick="sortTable(11)">Version</th>
+                <th onclick="sortTable(12)">Trusted Net</th>
+                <th onclick="sortTable(13)">Bytes Rx</th>
+                <th onclick="sortTable(14)">Bytes Tx</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in sessions %}
+            <tr{% if s.session_end == "In corso" %} class="active"{% endif %}>
+                <td>{{ s.username }}</td>
+                <td>{{ s.date }}</td>
+                <td>{{ s.session_start }}</td>
+                <td>{{ s.session_end }}</td>
+                <td>{{ s.duration }}</td>
+                <td>{{ s.public_ip }}</td>
+                <td>{{ s.private_ip }}</td>
+                <td>{{ s.city }}</td>
+                <td>{{ s.country }}</td>
+                <td>{{ s.device }}</td>
+                <td>{{ s.platform }}</td>
+                <td>{{ s.client_version }}</td>
+                <td>{{ s.trusted_network }}</td>
+                <td>{{ s.bytes_rx }}</td>
+                <td>{{ s.bytes_tx }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function sortTable(col) {
+    const table = document.getElementById("report-table");
+    const tbody = table.tBodies[0];
+    const rows = Array.from(tbody.rows);
+    const asc = table.dataset.sortCol == col ? !(table.dataset.sortAsc === "true") : true;
+    rows.sort((a, b) => {
+        const va = a.cells[col].textContent.trim();
+        const vb = b.cells[col].textContent.trim();
+        const na = parseFloat(va), nb = parseFloat(vb);
+        if (!isNaN(na) && !isNaN(nb)) return asc ? na - nb : nb - na;
+        return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+    });
+    rows.forEach(r => tbody.appendChild(r));
+    table.dataset.sortCol = col;
+    table.dataset.sortAsc = asc;
+}
+</script>
+{% endblock %}

@@ -1,0 +1,13 @@
+[Unit]
+Description=ZPA Status Mini-SIEM — web dashboard
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/web_dashboard.py
+WorkingDirectory=/opt/zpa-siem
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

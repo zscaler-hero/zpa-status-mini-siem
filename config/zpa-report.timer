@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ZPA report generator daily after midnight
+
+[Timer]
+# Fixed at 00:05 — report covers the previous day (midnight to midnight).
+# The service forces logrotate before generating the report.
+OnCalendar=*-*-* 00:05:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
