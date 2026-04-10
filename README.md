@@ -41,6 +41,7 @@ Organizations using Zscaler Private Access need visibility into user session act
 | **report_generator.py** | Parses logs, consolidates sessions, generates Excel + JSON |
 | **web_dashboard.py** | Flask HTTPS dashboard with auth, browse, search, download |
 | **share_upload.py** | Uploads reports to SMB/CIFS or SCP shares |
+| **zpa_siem_ctl.py** | Management CLI: health checks and report regeneration |
 | **install.sh** | Interactive installer for RHEL 9/10 |
 
 ## 🚀 Quick Start
@@ -70,11 +71,32 @@ sudo bash install.sh --configure   # Change settings without reinstalling
 sudo bash install.sh --uninstall   # Remove the installation
 ```
 
+### Health check and report management
+
+After installation, the `zpa-siem-ctl` command is available system-wide:
+
+```bash
+# Check for missing reports (days with logs but no report)
+sudo zpa-siem-ctl health
+
+# Check only the last 7 days
+sudo zpa-siem-ctl health --days 7
+
+# Regenerate a specific day's report
+sudo zpa-siem-ctl regen 2026-04-09
+
+# Regenerate all missing reports at once
+sudo zpa-siem-ctl regen --all
+```
+
 ### Generate a report manually
 
 ```bash
 # Process yesterday's rotated log (default)
 sudo /opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py
+
+# Process a specific date (finds all relevant log files automatically)
+sudo /opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py --date 2026-04-09
 
 # Process today's active log (for testing)
 sudo /opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py --log-file /var/log/zpa/zpa.log
@@ -160,7 +182,8 @@ This creates a self-contained zip that can be installed on air-gapped servers wi
 | Dashboard won't start | `journalctl -u zpa-dashboard -n 30` | Check Python errors in log |
 | No logs arriving | `ss -tlnp \| grep 514` | Verify rsyslog is listening |
 | Empty reports | `cat /var/log/zpa/zpa.log` | Confirm log data is flowing |
-| Report not generated | `systemctl status zpa-report.timer` | Check timer is active |
+| Report not generated | `journalctl -u zpa-report.service --since yesterday` | Check for errors, then `zpa-siem-ctl regen YYYY-MM-DD` |
+| Missing days | `sudo zpa-siem-ctl health` | Shows gaps, then `zpa-siem-ctl regen --all` |
 | Wrong timezone in reports | `cat /opt/zpa-siem/config.ini` | Update timezone, regenerate |
 | VM noise in reports | Config: `max_client_version` | Set to expected max major (e.g., `10`) |
 
@@ -169,6 +192,9 @@ This creates a self-contained zip that can be installed on air-gapped servers wi
 ```bash
 # Check what's in the active log
 wc -l /var/log/zpa/zpa.log
+
+# Check for missing reports
+sudo zpa-siem-ctl health
 
 # Generate with verbose output
 sudo /opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py --log-file /var/log/zpa/zpa.log

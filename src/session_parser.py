@@ -4,6 +4,7 @@ Parses ZPA syslog files, extracts user sessions, filters auth probes,
 and merges consecutive sessions caused by ZPA SessionID rotation.
 """
 
+import gzip
 import json
 from collections import defaultdict
 from datetime import datetime
@@ -45,9 +46,10 @@ def parse_log_line(line: str) -> Optional[dict]:
 
 
 def parse_log_file(path: str) -> list[dict]:
-    """Read a log file and return all valid JSON records."""
+    """Read a log file (plain or gzipped) and return all valid JSON records."""
     records = []
-    with open(path, errors="replace") as f:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, mode="rt", errors="replace") as f:
         for line in f:
             rec = parse_log_line(line)
             if rec:

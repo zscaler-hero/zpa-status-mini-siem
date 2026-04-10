@@ -87,12 +87,21 @@ prompt() {
 prompt_password() {
     local var_name="$1"
     local prompt_text="$2"
+    local has_existing="$3"    # "true" if an existing hash can be kept
     local value
 
     while true; do
-        read -rsp "  ${prompt_text}: " value
+        if [ "$has_existing" = "true" ]; then
+            read -rsp "  ${prompt_text} (Enter to keep current): " value
+        else
+            read -rsp "  ${prompt_text}: " value
+        fi
         echo
         if [ -z "$value" ]; then
+            if [ "$has_existing" = "true" ]; then
+                printf -v "$var_name" '%s' ""
+                return
+            fi
             warn "Password cannot be empty."
             continue
         fi
@@ -172,6 +181,12 @@ for section in c.sections():
             warn "Config file not found: $CONFIG_FILE"
         fi
         echo
+        if command -v zpa-siem-ctl &>/dev/null; then
+            success "CLI tool: zpa-siem-ctl installed"
+        else
+            warn "CLI tool: zpa-siem-ctl not found in PATH"
+        fi
+        echo
         if [ -d "$REPORTS_DIR" ]; then
             local_count=$(find "$REPORTS_DIR" -name "*.xlsx" 2>/dev/null | wc -l)
             info "Reports: $local_count Excel files in $REPORTS_DIR"
@@ -203,6 +218,7 @@ for section in c.sections():
         systemctl daemon-reload
         rm -f /etc/rsyslog.d/10-zpa.conf
         rm -f /etc/logrotate.d/zpa
+        rm -f /usr/local/bin/zpa-siem-ctl
         rm -rf "$INSTALL_DIR"
         success "ZPA Status Mini-SIEM uninstalled."
         info "Syslog logs in /var/log/zpa/ were preserved."
@@ -305,11 +321,23 @@ if [ "$CFG_DASHBOARD_ENABLED" = true ]; then
     done
 
     prompt CFG_DASHBOARD_USERNAME "Dashboard username" "$EXISTING_DASHBOARD_USERNAME"
-    prompt_password CFG_DASHBOARD_PASSWORD "Dashboard password"
+
+    # Check if an existing password hash is available (re-install / reconfigure)
+    HAS_EXISTING_HASH="false"
+    if [ -n "$EXISTING_DASHBOARD_PASSWORD_HASH" ] && [ "$EXISTING_DASHBOARD_PASSWORD_HASH" != '""' ]; then
+        HAS_EXISTING_HASH="true"
+    fi
+
+    prompt_password CFG_DASHBOARD_PASSWORD "Dashboard password" "$HAS_EXISTING_HASH"
     prompt CFG_DASHBOARD_TIMEOUT "Session timeout (minutes, 0=no timeout)" "$EXISTING_DASHBOARD_SESSION_TIMEOUT"
 
-    # Password will be hashed after venv is created (bcrypt not available in system Python)
-    CFG_DASHBOARD_HASH="__PENDING__"
+    if [ -z "$CFG_DASHBOARD_PASSWORD" ] && [ "$HAS_EXISTING_HASH" = "true" ]; then
+        # Keep existing hash — no re-hashing needed
+        CFG_DASHBOARD_HASH="$EXISTING_DASHBOARD_PASSWORD_HASH"
+    else
+        # New password — will be hashed after venv is created (bcrypt not available in system Python)
+        CFG_DASHBOARD_HASH="__PENDING__"
+    fi
 else
     CFG_DASHBOARD_PORT="$EXISTING_DASHBOARD_PORT"
     CFG_DASHBOARD_USERNAME="$EXISTING_DASHBOARD_USERNAME"
@@ -453,7 +481,7 @@ if [ "$CONFIGURE_ONLY" = false ]; then
     fi
 
     # Copy application files
-    for pyfile in report_generator.py session_parser.py config.py share_upload.py web_dashboard.py; do
+    for pyfile in report_generator.py session_parser.py config.py share_upload.py web_dashboard.py zpa_siem_ctl.py; do
         if [ -f "$SCRIPT_DIR/src/$pyfile" ]; then
             cp "$SCRIPT_DIR/src/$pyfile" "$INSTALL_DIR/$pyfile"
         fi
@@ -465,6 +493,14 @@ if [ "$CONFIGURE_ONLY" = false ]; then
     fi
 
     success "Application files installed to $INSTALL_DIR."
+
+    # CLI tool: zpa-siem-ctl → /usr/local/bin
+    cat > /usr/local/bin/zpa-siem-ctl <<'CTLEOF'
+#!/usr/bin/env bash
+exec /opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/zpa_siem_ctl.py "$@"
+CTLEOF
+    chmod +x /usr/local/bin/zpa-siem-ctl
+    success "CLI tool installed: zpa-siem-ctl"
 
     # ---------- 5. HTTPS certificates (T017) ----------
 
@@ -566,7 +602,7 @@ success "Configuration saved to $CONFIG_FILE"
 
 header "Configuring systemd"
 
-# Report service — forces logrotate before generating the report
+# Report service — finds all log files covering yesterday and date-filters
 cat > /etc/systemd/system/zpa-report.service <<'EOF'
 [Unit]
 Description=ZPA Status Mini-SIEM — daily report generator
@@ -574,7 +610,6 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStartPre=/usr/sbin/logrotate -f /etc/logrotate.d/zpa
 ExecStart=/opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py
 WorkingDirectory=/opt/zpa-siem
 EOF

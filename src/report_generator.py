@@ -5,6 +5,7 @@ Reads ZPA syslog files, extracts user sessions, and generates Excel + JSON repor
 
 Usage:
     python3 report_generator.py                        # process yesterday's log
+    python3 report_generator.py --date 2026-04-09      # process a specific date
     python3 report_generator.py --log-file path.log    # process a specific file
     python3 report_generator.py --output-dir ./reports  # custom output directory
 """
@@ -15,12 +16,13 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from session_parser import REPORT_COLUMNS, build_sessions, parse_log_file
+from session_parser import REPORT_COLUMNS, build_sessions, parse_log_file, parse_timestamp
 from config import Config
 
 
@@ -141,36 +143,69 @@ def cleanup_old_reports(output_dir: str, retention_days: int) -> None:
 # --- Main ---
 
 
-def get_rotated_log_path(log_dir: str) -> tuple[str, str]:
-    """Get the path to the most recent rotated log file and its report date.
+def find_log_sources(log_dir: str, report_date: str = None) -> tuple[list[str], str]:
+    """Find all log files that may contain data for the given date.
 
-    logrotate with dateext names the rotated file with TODAY's date
-    (the date of rotation), not yesterday's. The file contains
-    yesterday's log data.
+    logrotate does NOT rotate at midnight — it runs when the system
+    cron fires (typically ~3 AM on RHEL).  So a day's data (midnight
+    to midnight) is almost always split across two files:
 
-    Returns (log_path, report_date) where report_date is yesterday's
-    date in YYYY-MM-DD format (the date the logs cover).
+      - The rotated file from that day's rotation (contains the early
+        morning hours: 00:00 → ~03:00)
+      - The rotated file from the next day's rotation, OR the active
+        zpa.log (contains the rest: ~03:00 → 23:59)
+
+    We collect ALL candidate files and let the caller date-filter.
+
+    Args:
+        log_dir: directory containing log files
+        report_date: target date as YYYY-MM-DD (default: yesterday)
+
+    Returns (log_paths, report_date).
     """
-    yesterday = datetime.now() - timedelta(days=1)
-    report_date = yesterday.strftime("%Y-%m-%d")
+    if report_date:
+        target = datetime.strptime(report_date, "%Y-%m-%d")
+    else:
+        target = datetime.now() - timedelta(days=1)
+        report_date = target.strftime("%Y-%m-%d")
 
-    # logrotate uses the rotation date (today) in the filename
-    today = datetime.now().strftime("%Y%m%d")
-    today_path = os.path.join(log_dir, f"zpa.log-{today}")
-    if os.path.exists(today_path):
-        return today_path, report_date
+    target_fmt = target.strftime("%Y%m%d")
+    next_day_fmt = (target + timedelta(days=1)).strftime("%Y%m%d")
 
-    # Fallback: try yesterday's date in filename
-    yesterday_fmt = yesterday.strftime("%Y%m%d")
-    return os.path.join(log_dir, f"zpa.log-{yesterday_fmt}"), report_date
+    # Rotated file from the day after target (contains bulk of target day)
+    # and rotated file from target day (contains early morning of target)
+    candidates = [
+        f"zpa.log-{next_day_fmt}",
+        f"zpa.log-{next_day_fmt}.gz",
+        f"zpa.log-{target_fmt}",
+        f"zpa.log-{target_fmt}.gz",
+    ]
+
+    found = []
+    for name in candidates:
+        path = os.path.join(log_dir, name)
+        if os.path.exists(path):
+            found.append(path)
+
+    # Include the active log only if target date is recent (today or yesterday)
+    # — for older dates the active log cannot contain relevant data
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    if report_date in (today, yesterday):
+        active = os.path.join(log_dir, "zpa.log")
+        if os.path.exists(active):
+            found.append(active)
+
+    return found, report_date
 
 
 def main():
     config = Config()
 
     parser = argparse.ArgumentParser(description="ZPA Status Mini-SIEM Report Generator")
-    parser.add_argument("--log-file", help="Path to log file to process (default: yesterday's rotated log)")
+    parser.add_argument("--log-file", help="Path to a specific log file to process")
     parser.add_argument("--log-dir", default=config.log_dir, help="Directory containing log files")
+    parser.add_argument("--date", default=None, help="Report date YYYY-MM-DD (default: yesterday)")
     parser.add_argument("--output-dir", default=config.output_dir, help="Directory for output reports")
     parser.add_argument("--output-file", help="Specific output file path (overrides --output-dir)")
     parser.add_argument("--timezone", default=config.timezone_name, help="Timezone for report timestamps")
@@ -181,31 +216,57 @@ def main():
     if args.config:
         config = Config(args.config)
 
-    from zoneinfo import ZoneInfo
     tz = ZoneInfo(args.timezone)
     print(f"Timezone: {args.timezone}")
 
-    # Determine input file and report date
-    if args.log_file:
-        log_path = args.log_file
-        # For manual runs, derive report date from the log filename or use today
-        date_match = re.search(r"(\d{4})(\d{2})(\d{2})", os.path.basename(log_path))
-        if date_match:
-            y, m, d = date_match.groups()
-            report_date = f"{y}-{m}-{d}"
-        else:
-            report_date = datetime.now().strftime("%Y-%m-%d")
-    else:
-        log_path, report_date = get_rotated_log_path(args.log_dir)
+    # Validate --date format if provided
+    if args.date:
+        try:
+            datetime.strptime(args.date, "%Y-%m-%d")
+        except ValueError:
+            print(f"ERROR: Invalid date format: {args.date} (expected YYYY-MM-DD)", file=sys.stderr)
+            sys.exit(1)
 
-    if not os.path.exists(log_path):
-        print(f"ERROR: Log file not found: {log_path}", file=sys.stderr)
+    # Determine input file(s) and report date
+    if args.log_file:
+        log_paths = [args.log_file]
+        # For manual runs with --log-file, derive date from filename or --date or today
+        if args.date:
+            report_date = args.date
+        else:
+            date_match = re.search(r"(\d{4})(\d{2})(\d{2})", os.path.basename(args.log_file))
+            if date_match:
+                y, m, d = date_match.groups()
+                report_date = f"{y}-{m}-{d}"
+            else:
+                report_date = datetime.now().strftime("%Y-%m-%d")
+    else:
+        log_paths, report_date = find_log_sources(args.log_dir, args.date)
+
+    if not log_paths:
+        print("ERROR: No log files found", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Reading log file: {log_path}")
     print(f"Report date: {report_date}")
-    records = parse_log_file(log_path)
-    print(f"  Total records: {len(records)}")
+
+    # Read records from all candidate files
+    all_records = []
+    for lp in log_paths:
+        recs = parse_log_file(lp)
+        print(f"  {os.path.basename(lp)}: {len(recs)} records")
+        all_records.extend(recs)
+    print(f"  Total records: {len(all_records)}")
+
+    # Filter to only the target date (midnight to midnight in local tz)
+    day_start = datetime(*(int(x) for x in report_date.split("-")), tzinfo=tz) \
+        .astimezone(ZoneInfo("UTC"))
+    day_end = day_start + timedelta(days=1)
+    records = []
+    for rec in all_records:
+        ts = parse_timestamp(rec.get("TimestampAuthentication", ""))
+        if ts and day_start <= ts < day_end:
+            records.append(rec)
+    print(f"  After date filter ({report_date}): {len(records)}")
 
     max_ver = config.max_client_version
     if max_ver > 0:
