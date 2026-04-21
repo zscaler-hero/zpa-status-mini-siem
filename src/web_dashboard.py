@@ -145,7 +145,11 @@ def _list_available_reports():
         except (json.JSONDecodeError, OSError):
             session_count = 0
 
-        reports.append({"date": date_str, "session_count": session_count})
+        has_csv = any(
+            f.endswith(".csv") and date_str in f
+            for f in os.listdir(reports_dir)
+        )
+        reports.append({"date": date_str, "session_count": session_count, "has_csv": has_csv})
 
     reports.sort(key=lambda r: r["date"], reverse=True)
     return reports
@@ -186,27 +190,45 @@ def report(date):
         flash(f"Report not found for {date}.")
         return redirect(url_for("index"))
 
+    reports_dir = _get_reports_dir()
+    has_csv = any(
+        f.endswith(".csv") and date in f
+        for f in os.listdir(reports_dir)
+    )
+
     return render_template(
         "report.html",
         date=date,
         sessions=data.get("sessions", []),
         timezone=data.get("timezone", ""),
         generated_at=data.get("generated_at", ""),
+        has_csv=has_csv,
     )
 
 
 @app.route("/report/<date>/download")
 @login_required
 def download(date):
+    return _download_report(date, ".xlsx")
+
+
+@app.route("/report/<date>/download/csv")
+@login_required
+def download_csv(date):
+    return _download_report(date, ".csv")
+
+
+def _download_report(date, ext):
     reports_dir = _get_reports_dir()
     for filename in os.listdir(reports_dir):
-        if filename.endswith(".xlsx") and date in filename:
+        if filename.endswith(ext) and date in filename:
             return send_file(
                 os.path.join(reports_dir, filename),
                 as_attachment=True,
                 download_name=filename,
             )
-    flash(f"Excel file not found for {date}.")
+    label = "CSV" if ext == ".csv" else "Excel"
+    flash(f"{label} file not found for {date}.")
     return redirect(url_for("index"))
 
 

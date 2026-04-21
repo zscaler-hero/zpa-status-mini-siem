@@ -48,7 +48,8 @@
             <a href="/report/{{ r.date }}">{{ r.date }}</a>
             <span>
                 {{ r.session_count }} sessions
-                <a href="/report/{{ r.date }}/download" class="btn btn-sm" style="margin-left: 0.5rem;">Download</a>
+                <a href="/report/{{ r.date }}/download" class="btn btn-sm" style="margin-left: 0.5rem;">Excel</a>
+                {% if r.has_csv %}<a href="/report/{{ r.date }}/download/csv" class="btn btn-sm" style="margin-left: 0.3rem;">CSV</a>{% endif %}
             </span>
         </li>
         {% endfor %}

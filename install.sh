@@ -264,6 +264,7 @@ EXISTING_DASHBOARD_USERNAME="admin"
 EXISTING_DASHBOARD_SESSION_TIMEOUT="30"
 EXISTING_SHARE_ENABLED="false"
 EXISTING_SHARE_METHOD="smb"
+EXISTING_SHARE_FORMAT="xlsx"
 EXISTING_SHARE_SMB_SHARE=""
 EXISTING_SHARE_SMB_USERNAME=""
 EXISTING_SHARE_SMB_PASSWORD=""
@@ -351,6 +352,7 @@ prompt_yesno CFG_SHARE_ENABLED "Enable report upload to file share? (yes/no)" \
     "$([ "$EXISTING_SHARE_ENABLED" = "true" ] && echo "yes" || echo "no")"
 
 CFG_SHARE_METHOD="$EXISTING_SHARE_METHOD"
+CFG_SHARE_FORMAT="$EXISTING_SHARE_FORMAT"
 CFG_SMB_SHARE="$EXISTING_SHARE_SMB_SHARE"
 CFG_SMB_USERNAME="$EXISTING_SHARE_SMB_USERNAME"
 CFG_SMB_PASSWORD="$EXISTING_SHARE_SMB_PASSWORD"
@@ -359,6 +361,7 @@ CFG_SCP_TARGET="$EXISTING_SHARE_SCP_TARGET"
 
 if [ "$CFG_SHARE_ENABLED" = true ]; then
     prompt CFG_SHARE_METHOD "Upload method (smb/scp)" "$EXISTING_SHARE_METHOD"
+    prompt CFG_SHARE_FORMAT "Upload file format (xlsx/csv)" "$EXISTING_SHARE_FORMAT"
 
     if [ "$CFG_SHARE_METHOD" = "smb" ]; then
         prompt CFG_SMB_SHARE "SMB share path (e.g., //server/share)" "$EXISTING_SHARE_SMB_SHARE"
@@ -389,6 +392,7 @@ fi
 echo -e "  Share upload:   ${BOLD}$CFG_SHARE_ENABLED${NC}"
 if [ "$CFG_SHARE_ENABLED" = true ]; then
     echo -e "  Share method:   ${BOLD}$CFG_SHARE_METHOD${NC}"
+    echo -e "  Share format:   ${BOLD}$CFG_SHARE_FORMAT${NC}"
 fi
 echo
 
@@ -487,8 +491,9 @@ if [ "$CONFIGURE_ONLY" = false ]; then
         fi
     done
 
-    # Copy templates directory
+    # Copy templates directory (remove old first to avoid nested copy)
     if [ -d "$SCRIPT_DIR/src/templates" ]; then
+        rm -rf "$INSTALL_DIR/templates"
         cp -r "$SCRIPT_DIR/src/templates" "$INSTALL_DIR/templates"
     fi
 
@@ -586,6 +591,8 @@ session_timeout = $CFG_DASHBOARD_TIMEOUT
 enabled = $CFG_SHARE_ENABLED
 # Upload method: smb or scp
 method = $CFG_SHARE_METHOD
+# File format to upload: xlsx or csv
+format = $CFG_SHARE_FORMAT
 # SMB settings
 smb_share = $CFG_SMB_SHARE
 smb_username = $CFG_SMB_USERNAME
@@ -674,7 +681,7 @@ if [ "$CFG_DASHBOARD_ENABLED" = true ]; then
     echo -e "  ${GREEN}Dashboard:${NC} https://$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'localhost'):$CFG_DASHBOARD_PORT"
 fi
 if [ "$CFG_SHARE_ENABLED" = true ]; then
-    echo -e "  ${GREEN}Share:${NC}     $CFG_SHARE_METHOD upload enabled"
+    echo -e "  ${GREEN}Share:${NC}     $CFG_SHARE_METHOD upload enabled ($CFG_SHARE_FORMAT format)"
 fi
 echo -e "  ${GREEN}Config:${NC}    $CONFIG_FILE"
 echo

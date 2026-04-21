@@ -50,6 +50,8 @@ session_timeout = 30
 enabled = false
 # Upload method: smb or scp
 method = smb
+# File format to upload: xlsx or csv
+format = xlsx
 # --- SMB settings (used when method = smb) ---
 # UNC path to the share (e.g., //fileserver/reports/zpa)
 smb_share =

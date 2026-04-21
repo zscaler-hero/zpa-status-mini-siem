@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -82,6 +83,17 @@ def generate_excel(sessions: list[dict], output_path: str) -> None:
 # --- JSON generation ---
 
 
+def generate_csv(sessions: list[dict], output_path: str) -> None:
+    """Generate a semicolon-delimited CSV report from consolidated sessions."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=REPORT_COLUMNS, delimiter=";", extrasaction="ignore"
+        )
+        writer.writeheader()
+        writer.writerows(sessions)
+
+
 def generate_json(sessions: list[dict], output_path: str, timezone_name: str) -> None:
     """Generate the JSON report from consolidated sessions."""
     report = {
@@ -125,7 +137,7 @@ def cleanup_old_reports(output_dir: str, retention_days: int) -> None:
     date_pattern = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
     for filename in os.listdir(output_dir):
-        if not (filename.endswith(".xlsx") or filename.endswith(".json")):
+        if not (filename.endswith(".xlsx") or filename.endswith(".csv") or filename.endswith(".json")):
             continue
         match = date_pattern.search(filename)
         if not match:
@@ -289,6 +301,11 @@ def main():
     generate_excel(sessions, excel_path)
     print(f"  Excel report: {excel_path}")
 
+    # Generate CSV report alongside Excel
+    csv_path = os.path.splitext(excel_path)[0] + ".csv"
+    generate_csv(sessions, csv_path)
+    print(f"  CSV report:   {csv_path}")
+
     # Generate JSON report alongside Excel
     json_path = os.path.splitext(excel_path)[0] + ".json"
     generate_json(sessions, json_path, args.timezone)
@@ -297,7 +314,8 @@ def main():
     # Upload to file share if enabled
     if config.share_enabled:
         from share_upload import upload_report
-        success, msg = upload_report(excel_path, config)
+        upload_path = csv_path if config.share_format == "csv" else excel_path
+        success, msg = upload_report(upload_path, config)
         if success:
             print(f"  Share upload:  {msg}")
         else:

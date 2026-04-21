@@ -36,6 +36,7 @@ DEFAULTS = {
     "share": {
         "enabled": "false",
         "method": "smb",
+        "format": "xlsx",
         "smb_share": "",
         "smb_username": "",
         "smb_password": "",
@@ -145,6 +146,10 @@ class Config:
     @property
     def share_method(self) -> str:
         return self._get("share", "method")
+
+    @property
+    def share_format(self) -> str:
+        return self._get("share", "format")
 
     @property
     def smb_share(self) -> str:
