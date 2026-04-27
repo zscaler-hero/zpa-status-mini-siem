@@ -8,6 +8,7 @@ Commands:
 Usage:
     zpa-siem-ctl health [--days N]
     zpa-siem-ctl regen YYYY-MM-DD
+    zpa-siem-ctl regen --all [--force]
 """
 
 import argparse
@@ -128,12 +129,19 @@ def cmd_regen(args, config: Config) -> int:
         log_dates = find_log_dates(log_dir)
         today = datetime.now().strftime("%Y-%m-%d")
         log_dates.discard(today)
-        reports = find_reports(output_dir)
-        dates = sorted(d for d in log_dates if d not in reports)
-        if not dates:
-            print("No missing reports to regenerate.")
-            return 0
-        print(f"Regenerating {len(dates)} missing reports...")
+        if args.force:
+            dates = sorted(log_dates)
+            if not dates:
+                print("No log dates available to regenerate.")
+                return 0
+            print(f"Regenerating {len(dates)} reports (--force: including existing)...")
+        else:
+            reports = find_reports(output_dir)
+            dates = sorted(d for d in log_dates if d not in reports)
+            if not dates:
+                print("No missing reports to regenerate. Use --force to rebuild existing reports.")
+                return 0
+            print(f"Regenerating {len(dates)} missing reports...")
     elif args.date:
         dates = [args.date]
     else:
@@ -206,6 +214,8 @@ def main():
     regen_p.add_argument("date", nargs="?", help="Date to regenerate (YYYY-MM-DD)")
     regen_p.add_argument("--all", dest="all_missing", action="store_true",
                          help="Regenerate all missing reports")
+    regen_p.add_argument("--force", action="store_true",
+                         help="With --all: rebuild every day with logs, including those that already have a report")
 
     args = parser.parse_args()
     if not args.command:

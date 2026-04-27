@@ -141,6 +141,8 @@ def build_sessions(records: list[dict], tz: ZoneInfo,
         if len(parts) > 4:
             version = ".".join(parts[:4])
 
+        unauth_local = unauth_ts.astimezone(tz) if unauth_ts else None
+
         sessions.append({
             "Username": username,
             "Date": auth_local.strftime("%Y-%m-%d"),
@@ -157,10 +159,15 @@ def build_sessions(records: list[dict], tz: ZoneInfo,
             "Trusted Network": trusted_str,
             "Bytes Rx": last.get("TotalBytesRx", 0),
             "Bytes Tx": last.get("TotalBytesTx", 0),
+            "_start_dt": auth_local,
+            "_end_dt": unauth_local,
         })
 
     sessions.sort(key=lambda s: (s["Username"], s["Date"], s["Session Start"]))
     sessions = merge_sessions(sessions)
+    for s in sessions:
+        s.pop("_start_dt", None)
+        s.pop("_end_dt", None)
     return sessions
 
 
@@ -192,9 +199,13 @@ def merge_sessions(sessions: list[dict]) -> list[dict]:
             current = s.copy()
             continue
 
-        cur_end = datetime.strptime(current["Session End"], "%H:%M:%S")
-        next_start = datetime.strptime(s["Session Start"], "%H:%M:%S")
-        gap_sec = (next_start - cur_end).total_seconds()
+        cur_end_dt = current.get("_end_dt")
+        next_start_dt = s.get("_start_dt")
+        if cur_end_dt is None or next_start_dt is None:
+            merged.append(current)
+            current = s.copy()
+            continue
+        gap_sec = (next_start_dt - cur_end_dt).total_seconds()
 
         # Only merge if context hasn't changed (same network location)
         same_context = (
@@ -204,14 +215,14 @@ def merge_sessions(sessions: list[dict]) -> list[dict]:
 
         if gap_sec <= SESSION_MERGE_GAP_SECONDS and same_context:
             current["Session End"] = s["Session End"]
+            current["_end_dt"] = s.get("_end_dt")
             for field in ("Public IP", "Private IP", "City", "Country",
                           "Device", "Platform", "Client Version",
                           "Trusted Network", "Bytes Rx", "Bytes Tx"):
                 current[field] = s[field]
-            if current["Session End"] != "In corso":
-                start = datetime.strptime(current["Session Start"], "%H:%M:%S")
-                end = datetime.strptime(current["Session End"], "%H:%M:%S")
-                current["Duration"] = format_duration((end - start).total_seconds())
+            if current["Session End"] != "In corso" and current["_end_dt"] is not None:
+                duration_sec = (current["_end_dt"] - current["_start_dt"]).total_seconds()
+                current["Duration"] = format_duration(duration_sec)
             else:
                 current["Duration"] = "In corso"
         else:
