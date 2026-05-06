@@ -22,16 +22,18 @@
                 <th onclick="sortTable(2)">Start</th>
                 <th onclick="sortTable(3)">End</th>
                 <th onclick="sortTable(4)">Duration</th>
-                <th onclick="sortTable(5)">Public IP</th>
-                <th onclick="sortTable(6)">Private IP</th>
-                <th onclick="sortTable(7)">City</th>
-                <th onclick="sortTable(8)">Country</th>
-                <th onclick="sortTable(9)">Device</th>
-                <th onclick="sortTable(10)">Platform</th>
-                <th onclick="sortTable(11)">Version</th>
-                <th onclick="sortTable(12)">Trusted Net</th>
-                <th onclick="sortTable(13)">Bytes Rx</th>
-                <th onclick="sortTable(14)">Bytes Tx</th>
+                <th onclick="sortTable(5)">Main Public IP</th>
+                <th onclick="sortTable(6)">Other Public IPs</th>
+                <th onclick="sortTable(7)">Main Private IP</th>
+                <th onclick="sortTable(8)">Other Private IPs</th>
+                <th onclick="sortTable(9)">City</th>
+                <th onclick="sortTable(10)">Country</th>
+                <th onclick="sortTable(11)">Device</th>
+                <th onclick="sortTable(12)">Platform</th>
+                <th onclick="sortTable(13)">Version</th>
+                <th onclick="sortTable(14)">Trusted Net</th>
+                <th onclick="sortTable(15)">Bytes Rx</th>
+                <th onclick="sortTable(16)">Bytes Tx</th>
             </tr>
         </thead>
         <tbody>
@@ -42,8 +44,10 @@
                 <td>{{ s.session_start }}</td>
                 <td>{{ s.session_end }}</td>
                 <td>{{ s.duration }}</td>
-                <td>{{ s.public_ip }}</td>
-                <td>{{ s.private_ip }}</td>
+                <td>{{ s.main_public_ip }}</td>
+                <td>{{ s.other_public_ips|join(", ") }}</td>
+                <td>{{ s.main_private_ip }}</td>
+                <td>{{ s.other_private_ips|join(", ") }}</td>
                 <td>{{ s.city }}</td>
                 <td>{{ s.country }}</td>
                 <td>{{ s.device }}</td>

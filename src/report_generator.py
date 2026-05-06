@@ -107,8 +107,10 @@ def generate_json(sessions: list[dict], output_path: str, timezone_name: str) ->
                 "session_start": s["Session Start"],
                 "session_end": s["Session End"],
                 "duration": s["Duration"],
-                "public_ip": s["Public IP"],
-                "private_ip": s["Private IP"],
+                "main_public_ip": s["Main Public IP"],
+                "other_public_ips": [ip for ip in s["Other Public IPs"].split(", ") if ip],
+                "main_private_ip": s["Main Private IP"],
+                "other_private_ips": [ip for ip in s["Other Private IPs"].split(", ") if ip],
                 "city": s["City"],
                 "country": s["Country"],
                 "device": s["Device"],
@@ -117,6 +119,7 @@ def generate_json(sessions: list[dict], output_path: str, timezone_name: str) ->
                 "trusted_network": s["Trusted Network"],
                 "bytes_rx": s["Bytes Rx"],
                 "bytes_tx": s["Bytes Tx"],
+                "session_ids": s.get("_session_ids", []),
             }
             for s in sessions
         ],
@@ -222,6 +225,8 @@ def main():
     parser.add_argument("--output-file", help="Specific output file path (overrides --output-dir)")
     parser.add_argument("--timezone", default=config.timezone_name, help="Timezone for report timestamps")
     parser.add_argument("--config", default=None, help="Path to config.ini file")
+    parser.add_argument("--no-upload", action="store_true",
+                        help="Skip share upload even if enabled in config (used by regen)")
     args = parser.parse_args()
 
     # Reload config if custom path specified
@@ -311,8 +316,8 @@ def main():
     generate_json(sessions, json_path, args.timezone)
     print(f"  JSON report:  {json_path}")
 
-    # Upload to file share if enabled
-    if config.share_enabled:
+    # Upload to file share if enabled (skip on --no-upload)
+    if config.share_enabled and not args.no_upload:
         from share_upload import upload_report
         upload_path = csv_path if config.share_format == "csv" else excel_path
         success, msg = upload_report(upload_path, config)
@@ -320,6 +325,8 @@ def main():
             print(f"  Share upload:  {msg}")
         else:
             print(f"  Share upload FAILED: {msg}", file=sys.stderr)
+    elif config.share_enabled and args.no_upload:
+        print("  Share upload:  skipped (--no-upload)")
 
     # Clean up old reports
     cleanup_old_reports(args.output_dir, config.retention_days)

@@ -21,7 +21,7 @@
         <thead>
             <tr>
                 <th>Username</th><th>Date</th><th>Start</th><th>End</th><th>Duration</th>
-                <th>Public IP</th><th>City</th><th>Country</th>
+                <th>Main Public IP</th><th>City</th><th>Country</th>
                 <th>Device</th><th>Platform</th><th>Version</th>
                 <th>Trusted Net</th><th>Rx</th><th>Tx</th>
             </tr>
@@ -32,7 +32,7 @@
                 <td>{{ s.username }}</td>
                 <td><a href="/report/{{ s.date }}">{{ s.date }}</a></td>
                 <td>{{ s.session_start }}</td><td>{{ s.session_end }}</td><td>{{ s.duration }}</td>
-                <td>{{ s.public_ip }}</td><td>{{ s.city }}</td><td>{{ s.country }}</td>
+                <td>{{ s.main_public_ip }}</td><td>{{ s.city }}</td><td>{{ s.country }}</td>
                 <td>{{ s.device }}</td><td>{{ s.platform }}</td><td>{{ s.client_version }}</td>
                 <td>{{ s.trusted_network }}</td><td>{{ s.bytes_rx }}</td><td>{{ s.bytes_tx }}</td>
             </tr>

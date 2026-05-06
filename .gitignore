@@ -24,6 +24,8 @@ venv/
 # Logs (raw syslog data can be large)
 logs/*.log
 logs/*.gz
+logs/*.export
+*.export
 
 # Generated reports
 reports/*.xlsx

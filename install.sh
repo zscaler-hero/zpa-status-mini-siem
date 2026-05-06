@@ -269,7 +269,11 @@ EXISTING_SHARE_SMB_SHARE=""
 EXISTING_SHARE_SMB_USERNAME=""
 EXISTING_SHARE_SMB_PASSWORD=""
 EXISTING_SHARE_SMB_DOMAIN=""
-EXISTING_SHARE_SCP_TARGET=""
+EXISTING_SHARE_SCP_HOST=""
+EXISTING_SHARE_SCP_PORT=""
+EXISTING_SHARE_SCP_PATH=""
+EXISTING_SHARE_SCP_USERNAME=""
+EXISTING_SHARE_SCP_PASSWORD=""
 
 load_existing_config 2>/dev/null || true
 
@@ -357,7 +361,11 @@ CFG_SMB_SHARE="$EXISTING_SHARE_SMB_SHARE"
 CFG_SMB_USERNAME="$EXISTING_SHARE_SMB_USERNAME"
 CFG_SMB_PASSWORD="$EXISTING_SHARE_SMB_PASSWORD"
 CFG_SMB_DOMAIN="$EXISTING_SHARE_SMB_DOMAIN"
-CFG_SCP_TARGET="$EXISTING_SHARE_SCP_TARGET"
+CFG_SCP_HOST="$EXISTING_SHARE_SCP_HOST"
+CFG_SCP_PORT="$EXISTING_SHARE_SCP_PORT"
+CFG_SCP_PATH="$EXISTING_SHARE_SCP_PATH"
+CFG_SCP_USERNAME="$EXISTING_SHARE_SCP_USERNAME"
+CFG_SCP_PASSWORD="$EXISTING_SHARE_SCP_PASSWORD"
 
 if [ "$CFG_SHARE_ENABLED" = true ]; then
     prompt CFG_SHARE_METHOD "Upload method (smb/scp)" "$EXISTING_SHARE_METHOD"
@@ -370,7 +378,19 @@ if [ "$CFG_SHARE_ENABLED" = true ]; then
         echo
         prompt CFG_SMB_DOMAIN "SMB domain (leave empty if not needed)" "$EXISTING_SHARE_SMB_DOMAIN"
     elif [ "$CFG_SHARE_METHOD" = "scp" ]; then
-        prompt CFG_SCP_TARGET "SCP target (user@host:/path)" "$EXISTING_SHARE_SCP_TARGET"
+        info "Auth: leave username/password empty to use SSH key authentication."
+        prompt CFG_SCP_HOST "SCP host or IP (e.g., 10.0.0.10 or files.example.com)" "$EXISTING_SHARE_SCP_HOST"
+        prompt CFG_SCP_PORT "SCP port (leave empty for default 22)" "$EXISTING_SHARE_SCP_PORT"
+        prompt CFG_SCP_PATH "SCP remote path (e.g., /var/share/zpa)" "$EXISTING_SHARE_SCP_PATH"
+        prompt CFG_SCP_USERNAME "SCP username (optional)" "$EXISTING_SHARE_SCP_USERNAME"
+
+        scp_pass_hint=""
+        [ -n "$EXISTING_SHARE_SCP_PASSWORD" ] && scp_pass_hint=" (Enter to keep current)"
+        read -rsp "  SCP password${scp_pass_hint} (leave empty for SSH key auth): " CFG_SCP_PASSWORD
+        echo
+        if [ -z "$CFG_SCP_PASSWORD" ] && [ -n "$EXISTING_SHARE_SCP_PASSWORD" ]; then
+            CFG_SCP_PASSWORD="$EXISTING_SHARE_SCP_PASSWORD"
+        fi
     fi
 fi
 
@@ -393,6 +413,15 @@ echo -e "  Share upload:   ${BOLD}$CFG_SHARE_ENABLED${NC}"
 if [ "$CFG_SHARE_ENABLED" = true ]; then
     echo -e "  Share method:   ${BOLD}$CFG_SHARE_METHOD${NC}"
     echo -e "  Share format:   ${BOLD}$CFG_SHARE_FORMAT${NC}"
+    if [ "$CFG_SHARE_METHOD" = "scp" ]; then
+        scp_port_disp="${CFG_SCP_PORT:-22}"
+        echo -e "  SCP target:     ${BOLD}${CFG_SCP_USERNAME:+${CFG_SCP_USERNAME}@}${CFG_SCP_HOST}:${scp_port_disp}${CFG_SCP_PATH}${NC}"
+        if [ -n "$CFG_SCP_PASSWORD" ]; then
+            echo -e "  SCP auth:       ${BOLD}password (sshpass)${NC}"
+        else
+            echo -e "  SCP auth:       ${BOLD}SSH key${NC}"
+        fi
+    fi
 fi
 echo
 
@@ -528,6 +557,29 @@ CTLEOF
 
 fi  # end if not configure-only
 
+# ---------- sshpass for SCP password auth ----------
+
+if [ "$CFG_SHARE_ENABLED" = true ] && [ "$CFG_SHARE_METHOD" = "scp" ] && [ -n "$CFG_SCP_PASSWORD" ]; then
+    header "SCP password authentication"
+
+    if command -v sshpass &>/dev/null; then
+        success "sshpass already installed."
+    elif command -v dnf &>/dev/null; then
+        info "Installing sshpass (required for SCP password auth)..."
+        if dnf install -y sshpass &>/dev/null; then
+            success "sshpass installed."
+        elif dnf install -y epel-release &>/dev/null && dnf install -y sshpass &>/dev/null; then
+            success "sshpass installed (via EPEL)."
+        else
+            warn "Could not install sshpass automatically."
+            warn "Install manually: dnf install epel-release && dnf install sshpass"
+            warn "Until then, SCP uploads with password auth will fail at runtime."
+        fi
+    else
+        warn "dnf not found — install sshpass manually for SCP password auth."
+    fi
+fi
+
 # ---------- hash dashboard password (needs venv with bcrypt) ----------
 
 if [ "$CFG_DASHBOARD_HASH" = "__PENDING__" ]; then
@@ -598,8 +650,18 @@ smb_share = $CFG_SMB_SHARE
 smb_username = $CFG_SMB_USERNAME
 smb_password = $CFG_SMB_PASSWORD
 smb_domain = $CFG_SMB_DOMAIN
-# SCP settings
-scp_target = $CFG_SCP_TARGET
+# SCP settings (host, port, path are split into discrete fields)
+# Hostname or IP of the remote SSH/SCP server
+scp_host = $CFG_SCP_HOST
+# SSH port (leave empty for default 22)
+scp_port = $CFG_SCP_PORT
+# Remote directory where files will be placed
+scp_path = $CFG_SCP_PATH
+# Optional username (omit to use the runtime user / SSH config)
+scp_username = $CFG_SCP_USERNAME
+# Optional password — when set, sshpass is used for password authentication.
+# Leave empty to use SSH key authentication (recommended for production).
+scp_password = $CFG_SCP_PASSWORD
 CFGEOF
 
 chmod 600 "$CONFIG_FILE"

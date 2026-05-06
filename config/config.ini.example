@@ -62,5 +62,15 @@ smb_password =
 # SMB domain (optional, leave empty if not needed)
 smb_domain =
 # --- SCP settings (used when method = scp) ---
-# SCP target in user@host:/path format
-scp_target =
+# Hostname or IP of the remote SSH/SCP server
+scp_host =
+# SSH port (leave empty for default 22)
+scp_port =
+# Remote directory where files will be placed
+scp_path =
+# Optional username (omit to use the runtime user / SSH config)
+scp_username =
+# Optional password — when set, sshpass is used for password authentication
+# (requires the sshpass package, available via EPEL on RHEL).
+# Leave empty to use SSH key authentication (recommended for production).
+scp_password =

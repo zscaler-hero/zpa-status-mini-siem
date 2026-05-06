@@ -41,7 +41,11 @@ DEFAULTS = {
         "smb_username": "",
         "smb_password": "",
         "smb_domain": "",
-        "scp_target": "",
+        "scp_host": "",
+        "scp_port": "",
+        "scp_path": "",
+        "scp_username": "",
+        "scp_password": "",
     },
 }
 
@@ -168,5 +172,21 @@ class Config:
         return self._get("share", "smb_domain")
 
     @property
-    def scp_target(self) -> str:
-        return self._get("share", "scp_target")
+    def scp_host(self) -> str:
+        return self._get("share", "scp_host")
+
+    @property
+    def scp_port(self) -> str:
+        return self._get("share", "scp_port")
+
+    @property
+    def scp_path(self) -> str:
+        return self._get("share", "scp_path")
+
+    @property
+    def scp_username(self) -> str:
+        return self._get("share", "scp_username")
+
+    @property
+    def scp_password(self) -> str:
+        return self._get("share", "scp_password")
