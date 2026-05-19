@@ -51,6 +51,13 @@ username = admin
 password_hash =
 # Session timeout in minutes (0 = no timeout)
 session_timeout = 30
+# Enable the "Generate today's report now" button on the dashboard (true/false).
+# When clicked, generates a partial report for the current day without uploading
+# to the share. The midnight cron will overwrite it with the full daily report.
+enable_on_demand = true
+# Cutoff time (HH:MM, local timezone) after which on-demand generation is
+# blocked. Prevents collisions with the midnight cron run.
+on_demand_cutoff = 23:45
 
 [share]
 # Enable or disable automatic report upload to a file share (true/false)

@@ -32,6 +32,8 @@ DEFAULTS = {
         "username": "admin",
         "password_hash": "",
         "session_timeout": "30",
+        "enable_on_demand": "true",
+        "on_demand_cutoff": "23:45",
     },
     "logging": {
         "log_dir": "/var/log/zpa-siem",
@@ -154,6 +156,16 @@ class Config:
     @property
     def dashboard_session_timeout(self) -> int:
         return self._getint("dashboard", "session_timeout")
+
+    @property
+    def dashboard_enable_on_demand(self) -> bool:
+        return self._getbool("dashboard", "enable_on_demand")
+
+    @property
+    def dashboard_on_demand_cutoff(self) -> str:
+        """HH:MM cutoff (local timezone). After this, on-demand is blocked
+        to avoid colliding with the midnight cron run."""
+        return self._get("dashboard", "on_demand_cutoff")
 
     # --- share ---
     @property

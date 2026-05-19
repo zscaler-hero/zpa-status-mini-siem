@@ -39,7 +39,7 @@ Organizations using Zscaler Private Access need visibility into user session act
 | **rsyslog** | Receives ZPA syslog on TCP/514, writes to `/var/log/zpa/` |
 | **logrotate** | Daily rotation, 30-day retention, gzip compression |
 | **report_generator.py** | Parses logs, consolidates sessions, generates Excel + JSON |
-| **web_dashboard.py** | Flask HTTPS dashboard with auth, browse, search, download |
+| **web_dashboard.py** | Flask HTTPS dashboard with auth, browse, search, download, on-demand partial-report generation |
 | **share_upload.py** | Uploads reports to SMB/CIFS or SCP shares |
 | **zpa_siem_ctl.py** | Management CLI: health checks, report regeneration, share upload test |
 | **install.sh** | Interactive installer for RHEL 9/10 |
@@ -166,6 +166,36 @@ Generated Excel and JSON reports are written to `/opt/zpa-siem/reports/` by defa
 follow the pattern `zpa-report-YYYY-MM-DD.{xlsx,json,csv}` and are auto-pruned
 after `retention_days`.
 
+### On-demand partial report (web dashboard)
+
+The dashboard home page exposes a **Generate today's report now** button
+(*Refresh today's report* if one already exists). Clicking it runs the same
+generator code path against the current day's live log, without uploading to the
+share. The midnight cron will replace the partial file with the final daily
+report.
+
+Behavior and safeguards:
+
+- Synchronous: the request blocks until the report is built (or fails after a
+  5-minute timeout). The button shows "Generating..." while the worker is busy.
+- One generation at a time: a per-process `threading.Lock` plus an advisory
+  `fcntl.flock` on `<output_dir>/.ondemand-generation.lock` prevent overlap
+  with another click or with the scheduled job.
+- **Cutoff**: blocked after `[dashboard] on_demand_cutoff` (default `23:45`,
+  local timezone) to keep the dashboard out of the way of the midnight cron.
+  The button shows a "Paused" pill with the reason during the blocked window.
+- No share upload: the partial is for dashboard browsing/search only.
+- App log events: `event=ondemand_started`, `event=ondemand_complete`,
+  `event=ondemand_blocked`, `event=ondemand_skipped`, `event=ondemand_failed`.
+
+Disable the button entirely via `[dashboard] enable_on_demand = false` in
+`config.ini`. The equivalent CLI call is:
+
+```bash
+sudo /opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py \
+     --date "$(date +%F)" --no-upload
+```
+
 ### Application log
 
 All report runs and share uploads write to a persistent log file in addition to
@@ -226,7 +256,7 @@ See `config/config.ini.example` for all options with documentation.
 | `syslog` | port, protocol |
 | `logging` | log_dir, log_file (application log, default `/var/log/zpa-siem/app.log`) |
 | `reports` | output_dir (default `/opt/zpa-siem/reports`), schedule, retention_days, filename_pattern |
-| `dashboard` | enabled, port, username, password_hash |
+| `dashboard` | enabled, port, username, password_hash, session_timeout, enable_on_demand, on_demand_cutoff |
 | `share` | enabled, method (smb/scp), credentials |
 
 ### Version Filter
@@ -537,6 +567,8 @@ This creates a self-contained zip that can be installed on air-gapped servers wi
 | VM noise in reports | Config: `max_client_version` | Set to expected max major (e.g., `10`) |
 | Share upload fails | `sudo zpa-siem-ctl test-share` | Read the printed `scp`/`smbclient` error message (also logged to `/var/log/zpa-siem/app.log` with `event=upload_failed`) |
 | `sshpass: command not found` | SCP password mode without sshpass | `sudo dnf install epel-release && sudo dnf install sshpass`, or re-run `install.sh --configure` |
+| On-demand button disabled / "Paused" | Time past `[dashboard] on_demand_cutoff` (default `23:45`) or `enable_on_demand = false` | Wait for the midnight report, or change the cutoff/flag in `config.ini` |
+| On-demand "already in progress" | Another generation holds the lock | Wait for the in-flight run (or the scheduled job) to finish, then reload |
 
 ### Debug a report manually
 

@@ -6,12 +6,19 @@ searching by username, and downloading Excel files. Protected by basic auth
 over HTTPS with a self-signed certificate.
 """
 
+import errno
+import fcntl
 import json
 import os
 import re
 import secrets
-from datetime import datetime, timedelta
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, time as dtime, timedelta
 from functools import wraps
+from zoneinfo import ZoneInfo
 
 import bcrypt
 from flask import (
@@ -25,9 +32,19 @@ from flask import (
     url_for,
 )
 
+from app_logger import get_logger
 from config import Config
 
+log = get_logger(__name__)
+
 app = Flask(__name__)
+
+# In-process lock prevents two concurrent generations under the same Flask
+# worker. The on-disk sentinel below (fcntl.flock) covers cross-process
+# collisions with the systemd timer.
+_GEN_LOCK = threading.Lock()
+_GEN_SENTINEL = ".ondemand-generation.lock"
+_GEN_TIMEOUT_SECONDS = 300
 
 
 def create_app(config_path=None):
@@ -104,6 +121,35 @@ def _get_reports_dir():
     return os.path.abspath(app.config["ZPA_CONFIG"].output_dir)
 
 
+def _local_now(config) -> datetime:
+    """Current time in the configured timezone."""
+    return datetime.now(ZoneInfo(config.timezone_name))
+
+
+def _parse_cutoff(value: str) -> dtime:
+    """Parse an 'HH:MM' string into a time. Falls back to 23:45 on bad input."""
+    try:
+        hh, mm = value.split(":")
+        return dtime(int(hh), int(mm))
+    except (ValueError, AttributeError):
+        return dtime(23, 45)
+
+
+def _on_demand_block_reason(config) -> str | None:
+    """Return a human message if the on-demand button must be blocked, else None."""
+    if not config.dashboard_enable_on_demand:
+        return "On-demand generation is disabled in config.ini."
+    cutoff = _parse_cutoff(config.dashboard_on_demand_cutoff)
+    now_local = _local_now(config).time()
+    if now_local >= cutoff:
+        return (
+            f"On-demand generation is paused after {cutoff.strftime('%H:%M')} "
+            f"to avoid colliding with the nightly run. Please wait for the "
+            f"midnight report."
+        )
+    return None
+
+
 def _load_json_report(date_str):
     """Load a JSON report file. Returns dict or None."""
     reports_dir = _get_reports_dir()
@@ -161,8 +207,9 @@ def _list_available_reports():
 @app.route("/")
 @login_required
 def index():
+    config = app.config["ZPA_CONFIG"]
     reports = _list_available_reports()
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _local_now(config).strftime("%Y-%m-%d")
 
     today_sessions = None
     today_date = None
@@ -179,7 +226,130 @@ def index():
         reports=reports,
         today_sessions=today_sessions,
         today_date=today_date,
+        today_str=today,
+        on_demand_enabled=config.dashboard_enable_on_demand,
+        on_demand_blocked_reason=_on_demand_block_reason(config),
     )
+
+
+@app.route("/report/generate-today", methods=["POST"])
+@login_required
+def generate_today():
+    config = app.config["ZPA_CONFIG"]
+
+    blocked = _on_demand_block_reason(config)
+    if blocked:
+        flash(blocked)
+        log.info("event=ondemand_blocked reason=%s", blocked)
+        return redirect(url_for("index"))
+
+    today = _local_now(config).strftime("%Y-%m-%d")
+
+    # In-process lock: never block the request thread waiting for it.
+    if not _GEN_LOCK.acquire(blocking=False):
+        flash("A report generation is already in progress. Please wait and reload.")
+        log.info("event=ondemand_skipped reason=in_process_lock_busy date=%s", today)
+        return redirect(url_for("index"))
+
+    sentinel_path = os.path.join(_get_reports_dir(), _GEN_SENTINEL)
+    sentinel_fd = None
+    try:
+        try:
+            os.makedirs(_get_reports_dir(), exist_ok=True)
+            sentinel_fd = os.open(
+                sentinel_path, os.O_RDWR | os.O_CREAT, 0o644
+            )
+            fcntl.flock(sentinel_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                flash(
+                    "Another report generation is already running on this server "
+                    "(possibly the scheduled job). Please retry shortly."
+                )
+                log.info(
+                    "event=ondemand_skipped reason=file_lock_busy date=%s", today
+                )
+            else:
+                flash(f"Could not acquire generation lock: {exc}")
+                log.error(
+                    "event=ondemand_failed reason=lock_error date=%s error=%s",
+                    today, exc,
+                )
+            if sentinel_fd is not None:
+                os.close(sentinel_fd)
+                sentinel_fd = None
+            return redirect(url_for("index"))
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        generator = os.path.join(script_dir, "report_generator.py")
+        if not os.path.exists(generator):
+            flash(f"report_generator.py not found at {generator}.")
+            log.error("event=ondemand_failed reason=generator_missing path=%s", generator)
+            return redirect(url_for("index"))
+
+        cmd = [
+            sys.executable, generator,
+            "--date", today,
+            "--log-dir", config.log_dir,
+            "--output-dir", config.output_dir,
+            "--no-upload",
+        ]
+        if config.path:
+            cmd += ["--config", config.path]
+
+        log.info("event=ondemand_started date=%s", today)
+        started = time.monotonic()
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=_GEN_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            flash(
+                f"Generation timed out after {_GEN_TIMEOUT_SECONDS // 60} minutes. "
+                f"Check /var/log/zpa-siem/app.log for details."
+            )
+            log.error(
+                "event=ondemand_failed reason=timeout date=%s duration_ms=%d",
+                today, duration_ms,
+            )
+            return redirect(url_for("index"))
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+
+        if result.returncode == 0:
+            data = _load_json_report(today)
+            session_count = len(data.get("sessions", [])) if data else 0
+            if session_count:
+                flash(f"Today's report regenerated ({session_count} sessions).")
+            else:
+                flash(
+                    "No user sessions recorded for today yet. The report is empty; "
+                    "please retry later."
+                )
+            log.info(
+                "event=ondemand_complete date=%s sessions=%d duration_ms=%d",
+                today, session_count, duration_ms,
+            )
+        else:
+            tail = (result.stderr or result.stdout or "").strip().splitlines()[-3:]
+            detail = " | ".join(tail) if tail else f"exit code {result.returncode}"
+            flash(f"Generation failed: {detail}")
+            log.error(
+                "event=ondemand_failed reason=nonzero_exit date=%s exit=%d "
+                "duration_ms=%d detail=%s",
+                today, result.returncode, duration_ms, detail,
+            )
+
+        return redirect(url_for("index"))
+    finally:
+        if sentinel_fd is not None:
+            try:
+                fcntl.flock(sentinel_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(sentinel_fd)
+        _GEN_LOCK.release()
 
 
 @app.route("/report/<date>")

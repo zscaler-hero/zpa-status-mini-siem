@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Dashboard — ZPA Mini-SIEM{% endblock %}
+{% block title %}Dashboard - ZPA Mini-SIEM{% endblock %}
 {% block content %}
 <h1>Session Reports</h1>
 
@@ -10,9 +10,40 @@
     </form>
 </div>
 
+{% if on_demand_enabled %}
+<div class="card">
+    <div class="ondemand">
+        <div class="ondemand-info">
+            <strong>Today's report ({{ today_str }})</strong>
+            <span class="muted">
+                {% if today_sessions %}
+                    Last generated snapshot below. Click to refresh with the latest sessions.
+                {% else %}
+                    Not generated yet. Click to build a partial snapshot for the current day.
+                {% endif %}
+                The nightly job will overwrite it after midnight.
+            </span>
+        </div>
+        {% if on_demand_blocked_reason %}
+        <div class="ondemand-blocked" title="{{ on_demand_blocked_reason }}">
+            <button type="button" class="btn" disabled>Paused</button>
+            <span class="muted small">{{ on_demand_blocked_reason }}</span>
+        </div>
+        {% else %}
+        <form method="POST" action="{{ url_for('generate_today') }}"
+              class="ondemand-form" id="ondemand-form">
+            <button type="submit" class="btn" id="ondemand-btn">
+                {% if today_sessions %}Refresh today's report{% else %}Generate today's report now{% endif %}
+            </button>
+        </form>
+        {% endif %}
+    </div>
+</div>
+{% endif %}
+
 {% if today_sessions %}
 <div class="card">
-    <h2 style="margin-bottom: 0.8rem;">Today — {{ today_date }}</h2>
+    <h2 style="margin-bottom: 0.8rem;">Today - {{ today_date }}</h2>
     <div class="overflow-x">
     <table>
         <thead>
@@ -58,4 +89,20 @@
     <p class="empty">No reports available yet.</p>
     {% endif %}
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    (function () {
+        var form = document.getElementById('ondemand-form');
+        if (!form) return;
+        var btn = document.getElementById('ondemand-btn');
+        form.addEventListener('submit', function () {
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = 'Generating... this may take a moment';
+            }
+        });
+    })();
+</script>
 {% endblock %}

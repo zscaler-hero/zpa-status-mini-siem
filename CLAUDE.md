@@ -27,7 +27,7 @@ Target platform: **Red Hat Enterprise Linux 9/10**.
 - **Log Rotation**: logrotate handles daily rotation with 30-day retention, gzip compression, dateext naming.
 - **Session Parser** (`src/session_parser.py`): Shared module for log parsing, session consolidation, and merge logic.
 - **Report Generator** (`src/report_generator.py`): Runs daily (via systemd timer), generates Excel + JSON reports, uploads to file share, cleans up old reports.
-- **Web Dashboard** (`src/web_dashboard.py`): Flask HTTPS app with basic auth, report browsing, user search, and Excel download.
+- **Web Dashboard** (`src/web_dashboard.py`): Flask HTTPS app with basic auth, report browsing, user search, Excel/CSV download, and an on-demand button to regenerate today's partial report (blocked after a configurable cutoff to avoid colliding with the nightly run).
 - **Share Upload** (`src/share_upload.py`): Uploads reports to SMB/CIFS or SCP shares (includes best-effort remote delete for selftest cleanup).
 - **Management CLI** (`src/zpa_siem_ctl.py`): Health checks, regeneration, share connectivity test, and end-to-end selftest. Installed as `zpa-siem-ctl` in `/usr/local/bin/`.
 - **App Logger** (`src/app_logger.py`): Configures Python `logging` with stdout + `/var/log/zpa-siem/app.log` (rotated daily, 30-day retention via `/etc/logrotate.d/zpa-siem-app`).
@@ -58,6 +58,8 @@ sudo bash install.sh --uninstall   # Remove
 sudo /opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py
 # Dry-run (no files written, no upload — for ad-hoc smoke testing)
 sudo /opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py --dry-run
+# Today's partial report (same code path, no share upload — useful before midnight)
+sudo /opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py --date "$(date +%F)" --no-upload
 
 # Health check and report management
 sudo zpa-siem-ctl health              # Check for missing reports
