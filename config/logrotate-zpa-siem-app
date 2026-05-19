@@ -1,0 +1,17 @@
+# /etc/logrotate.d/zpa-siem-app
+# Daily rotation for the ZPA Status Mini-SIEM application log.
+# 30 days kept; older files compressed.
+# Uses copytruncate because Python's RotatingFileHandler keeps the file
+# descriptor open across rotations — copytruncate keeps the same inode
+# so the running process keeps writing without a restart.
+
+/var/log/zpa-siem/*.log {
+    daily
+    rotate 30
+    compress
+    missingok
+    notifempty
+    dateext
+    dateformat -%Y%m%d
+    copytruncate
+}

@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -25,6 +26,9 @@ from openpyxl.utils import get_column_letter
 
 from session_parser import REPORT_COLUMNS, build_sessions, parse_log_file, parse_timestamp
 from config import Config
+from app_logger import setup_logging, get_logger
+
+log = get_logger(__name__)
 
 
 # --- Excel generation ---
@@ -152,7 +156,7 @@ def cleanup_old_reports(output_dir: str, retention_days: int) -> None:
         if file_date < cutoff:
             filepath = os.path.join(output_dir, filename)
             os.remove(filepath)
-            print(f"  Cleaned up old report: {filename}")
+            log.info("Cleaned up old report: %s", filename)
 
 
 # --- Main ---
@@ -227,21 +231,27 @@ def main():
     parser.add_argument("--config", default=None, help="Path to config.ini file")
     parser.add_argument("--no-upload", action="store_true",
                         help="Skip share upload even if enabled in config (used by regen)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Parse and build sessions but do NOT write report files or upload. "
+                             "For production smoke tests.")
     args = parser.parse_args()
 
     # Reload config if custom path specified
     if args.config:
         config = Config(args.config)
 
+    setup_logging(config.app_log_dir, config.app_log_file)
+
+    started = time.monotonic()
     tz = ZoneInfo(args.timezone)
-    print(f"Timezone: {args.timezone}")
+    log.info("Report run started (timezone=%s)", args.timezone)
 
     # Validate --date format if provided
     if args.date:
         try:
             datetime.strptime(args.date, "%Y-%m-%d")
         except ValueError:
-            print(f"ERROR: Invalid date format: {args.date} (expected YYYY-MM-DD)", file=sys.stderr)
+            log.error("Invalid date format: %s (expected YYYY-MM-DD)", args.date)
             sys.exit(1)
 
     # Determine input file(s) and report date
@@ -261,18 +271,18 @@ def main():
         log_paths, report_date = find_log_sources(args.log_dir, args.date)
 
     if not log_paths:
-        print("ERROR: No log files found", file=sys.stderr)
+        log.error("event=report_failed reason=no_log_files date=%s", report_date or "unknown")
         sys.exit(1)
 
-    print(f"Report date: {report_date}")
+    log.info("Report date: %s", report_date)
 
     # Read records from all candidate files
     all_records = []
     for lp in log_paths:
         recs = parse_log_file(lp)
-        print(f"  {os.path.basename(lp)}: {len(recs)} records")
+        log.info("  %s: %d records", os.path.basename(lp), len(recs))
         all_records.extend(recs)
-    print(f"  Total records: {len(all_records)}")
+    log.info("  Total records: %d", len(all_records))
 
     # Filter to only the target date (midnight to midnight in local tz)
     day_start = datetime(*(int(x) for x in report_date.split("-")), tzinfo=tz) \
@@ -283,16 +293,30 @@ def main():
         ts = parse_timestamp(rec.get("TimestampAuthentication", ""))
         if ts and day_start <= ts < day_end:
             records.append(rec)
-    print(f"  After date filter ({report_date}): {len(records)}")
+    log.info("  After date filter (%s): %d", report_date, len(records))
 
     max_ver = config.max_client_version
     if max_ver > 0:
-        print(f"  Version filter: major <= {max_ver}")
+        log.info("  Version filter: major <= %d", max_ver)
     sessions = build_sessions(records, tz, max_client_version=max_ver)
-    print(f"  User sessions (after filtering): {len(sessions)}")
+    log.info("  User sessions (after filtering): %d", len(sessions))
 
     if not sessions:
-        print("  No sessions to report. Exiting.")
+        log.info(
+            "event=report_complete date=%s sessions=0 status=empty mode=%s duration_ms=%d",
+            report_date,
+            "dry_run" if args.dry_run else "normal",
+            int((time.monotonic() - started) * 1000),
+        )
+        sys.exit(0)
+
+    if args.dry_run:
+        log.info(
+            "event=report_complete date=%s sessions=%d mode=dry_run "
+            "status=ok duration_ms=%d (no files written, no upload attempted)",
+            report_date, len(sessions),
+            int((time.monotonic() - started) * 1000),
+        )
         sys.exit(0)
 
     # Determine output file — use report_date (from log), not session dates
@@ -304,32 +328,40 @@ def main():
         excel_path = os.path.join(args.output_dir, f"{filename}.xlsx")
 
     generate_excel(sessions, excel_path)
-    print(f"  Excel report: {excel_path}")
+    log.info("  Excel report: %s", excel_path)
 
     # Generate CSV report alongside Excel
     csv_path = os.path.splitext(excel_path)[0] + ".csv"
     generate_csv(sessions, csv_path)
-    print(f"  CSV report:   {csv_path}")
+    log.info("  CSV report:   %s", csv_path)
 
     # Generate JSON report alongside Excel
     json_path = os.path.splitext(excel_path)[0] + ".json"
     generate_json(sessions, json_path, args.timezone)
-    print(f"  JSON report:  {json_path}")
+    log.info("  JSON report:  %s", json_path)
 
     # Upload to file share if enabled (skip on --no-upload)
+    upload_status = "disabled"
     if config.share_enabled and not args.no_upload:
         from share_upload import upload_report
         upload_path = csv_path if config.share_format == "csv" else excel_path
         success, msg = upload_report(upload_path, config)
-        if success:
-            print(f"  Share upload:  {msg}")
-        else:
-            print(f"  Share upload FAILED: {msg}", file=sys.stderr)
+        upload_status = "ok" if success else "failed"
     elif config.share_enabled and args.no_upload:
-        print("  Share upload:  skipped (--no-upload)")
+        log.info("  Share upload:  skipped (--no-upload)")
+        upload_status = "skipped"
 
     # Clean up old reports
     cleanup_old_reports(args.output_dir, config.retention_days)
+
+    log.info(
+        "event=report_complete date=%s sessions=%d excel=%s csv=%s json=%s "
+        "upload=%s duration_ms=%d",
+        report_date, len(sessions),
+        os.path.basename(excel_path), os.path.basename(csv_path),
+        os.path.basename(json_path), upload_status,
+        int((time.monotonic() - started) * 1000),
+    )
 
 
 if __name__ == "__main__":

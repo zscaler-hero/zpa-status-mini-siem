@@ -22,6 +22,13 @@ protocol = tcp
 # Directory where rsyslog writes ZPA log files
 log_dir = /var/log/zpa
 
+[logging]
+# Directory for the application log (separate from the ZPA syslog files).
+# Managed by /etc/logrotate.d/zpa-siem-app (daily rotation, 30-day retention).
+log_dir = /var/log/zpa-siem
+# File name inside log_dir
+log_file = app.log
+
 [reports]
 # Directory for generated Excel and JSON reports
 output_dir = /opt/zpa-siem/reports

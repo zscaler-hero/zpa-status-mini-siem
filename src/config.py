@@ -33,6 +33,10 @@ DEFAULTS = {
         "password_hash": "",
         "session_timeout": "30",
     },
+    "logging": {
+        "log_dir": "/var/log/zpa-siem",
+        "log_file": "app.log",
+    },
     "share": {
         "enabled": "false",
         "method": "smb",
@@ -120,6 +124,15 @@ class Config:
     @property
     def filename_pattern(self) -> str:
         return self._get("reports", "filename_pattern")
+
+    # --- logging ---
+    @property
+    def app_log_dir(self) -> str:
+        return self._get("logging", "log_dir")
+
+    @property
+    def app_log_file(self) -> str:
+        return self._get("logging", "log_file")
 
     # --- dashboard ---
     @property

@@ -191,6 +191,16 @@ for section in c.sections():
             local_count=$(find "$REPORTS_DIR" -name "*.xlsx" 2>/dev/null | wc -l)
             info "Reports: $local_count Excel files in $REPORTS_DIR"
         fi
+        echo
+        if [ -f /var/log/zpa-siem/app.log ]; then
+            log_size=$(stat -c '%s' /var/log/zpa-siem/app.log 2>/dev/null || echo "?")
+            log_mtime=$(stat -c '%y' /var/log/zpa-siem/app.log 2>/dev/null | cut -d. -f1 || echo "?")
+            info "App log: /var/log/zpa-siem/app.log (${log_size} bytes, last write ${log_mtime})"
+            echo "  Last 5 lines:"
+            tail -n 5 /var/log/zpa-siem/app.log 2>/dev/null | sed 's/^/    /'
+        else
+            warn "App log /var/log/zpa-siem/app.log not yet created (no run executed)."
+        fi
         exit 0
         ;;
     --uninstall)
@@ -201,6 +211,7 @@ for section in c.sections():
         echo "    - systemd units (zpa-report, zpa-dashboard)"
         echo "    - /etc/rsyslog.d/10-zpa.conf"
         echo "    - /etc/logrotate.d/zpa"
+        echo "    - /etc/logrotate.d/zpa-siem-app"
         echo
         read -rp "  Are you sure? Type 'yes' to confirm: " confirm
         if [ "$confirm" != "yes" ]; then
@@ -218,10 +229,11 @@ for section in c.sections():
         systemctl daemon-reload
         rm -f /etc/rsyslog.d/10-zpa.conf
         rm -f /etc/logrotate.d/zpa
+        rm -f /etc/logrotate.d/zpa-siem-app
         rm -f /usr/local/bin/zpa-siem-ctl
         rm -rf "$INSTALL_DIR"
         success "ZPA Status Mini-SIEM uninstalled."
-        info "Syslog logs in /var/log/zpa/ were preserved."
+        info "Syslog logs in /var/log/zpa/ and application logs in /var/log/zpa-siem/ were preserved."
         exit 0
         ;;
     --configure)
@@ -458,7 +470,13 @@ if [ "$CONFIGURE_ONLY" = false ]; then
     cp "$SCRIPT_DIR/config/logrotate-zpa" /etc/logrotate.d/zpa
     chmod 644 /etc/logrotate.d/zpa
 
-    success "logrotate configured."
+    # Application log dir + its logrotate policy
+    mkdir -p /var/log/zpa-siem
+    chmod 750 /var/log/zpa-siem
+    cp "$SCRIPT_DIR/config/logrotate-zpa-siem-app" /etc/logrotate.d/zpa-siem-app
+    chmod 644 /etc/logrotate.d/zpa-siem-app
+
+    success "logrotate configured (syslog + application log)."
 
     # ---------- 3. firewall ----------
 
@@ -514,7 +532,7 @@ if [ "$CONFIGURE_ONLY" = false ]; then
     fi
 
     # Copy application files
-    for pyfile in report_generator.py session_parser.py config.py share_upload.py web_dashboard.py zpa_siem_ctl.py; do
+    for pyfile in report_generator.py session_parser.py config.py share_upload.py web_dashboard.py zpa_siem_ctl.py app_logger.py; do
         if [ -f "$SCRIPT_DIR/src/$pyfile" ]; then
             cp "$SCRIPT_DIR/src/$pyfile" "$INSTALL_DIR/$pyfile"
         fi
@@ -615,6 +633,12 @@ port = $CFG_SYSLOG_PORT
 protocol = $CFG_SYSLOG_PROTOCOL
 # Directory where rsyslog writes ZPA log files
 log_dir = /var/log/zpa
+
+[logging]
+# Application log directory (managed by /etc/logrotate.d/zpa-siem-app)
+log_dir = /var/log/zpa-siem
+# File name inside log_dir
+log_file = app.log
 
 [reports]
 # Directory for generated Excel and JSON reports
@@ -737,6 +761,7 @@ header "Installation Complete"
 
 echo -e "  ${GREEN}Syslog:${NC}    rsyslog listening on ${CFG_SYSLOG_PROTOCOL^^}/${CFG_SYSLOG_PORT} → /var/log/zpa/"
 echo -e "  ${GREEN}Rotate:${NC}    daily, 30-day retention, gzip"
+echo -e "  ${GREEN}App log:${NC}   /var/log/zpa-siem/app.log (rotated daily, 30-day retention)"
 echo -e "  ${GREEN}Reports:${NC}   daily at $CFG_SCHEDULE → $REPORTS_DIR"
 echo -e "  ${GREEN}Retention:${NC} $CFG_RETENTION days"
 if [ "$CFG_DASHBOARD_ENABLED" = true ]; then
@@ -747,5 +772,6 @@ if [ "$CFG_SHARE_ENABLED" = true ]; then
 fi
 echo -e "  ${GREEN}Config:${NC}    $CONFIG_FILE"
 echo
-echo -e "  Manage: ${BOLD}install.sh --status${NC} | ${BOLD}--configure${NC} | ${BOLD}--uninstall${NC}"
+echo -e "  Manage:    ${BOLD}install.sh --status${NC} | ${BOLD}--configure${NC} | ${BOLD}--uninstall${NC}"
+echo -e "  Smoketest: ${BOLD}zpa-siem-ctl selftest${NC}  (config + log writability + dry-run report + share check)"
 echo

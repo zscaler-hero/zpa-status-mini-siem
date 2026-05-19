@@ -96,6 +96,36 @@ sudo zpa-siem-ctl regen --all --force
 > daily systemd timer pushes reports. Use `test-share` (below) to validate
 > connectivity, or upload manually if you need to push a regenerated report.
 
+### Production smoke test (selftest)
+
+The `selftest` subcommand runs an end-to-end check of the whole pipeline
+**without creating permanent artifacts**. Recommended right after install and
+whenever something changes (config edit, share migration, OS upgrade):
+
+```bash
+# Full check: config + app log writability + log source + dry-run report + share upload
+sudo zpa-siem-ctl selftest
+
+# Skip the share upload step (useful when the share isn't reachable yet)
+sudo zpa-siem-ctl selftest --skip-share
+
+# Dry-run on a specific date instead of yesterday
+sudo zpa-siem-ctl selftest --date 2026-04-09
+```
+
+What it checks:
+1. `config.ini` is readable and has all required sections
+2. `/var/log/zpa-siem/app.log` is writable (writes a marker, reads it back)
+3. `/var/log/zpa/` exists and contains at least one readable `zpa.log*` file
+4. **Dry-run report generation** — parses logs and builds sessions in memory,
+   but writes **no** Excel/CSV/JSON files and does **not** attempt upload
+5. **Share connectivity** — uploads a tiny marker file and then **deletes it
+   from the remote share** (best-effort cleanup via `smbclient del` / `ssh rm`).
+   If the remote cleanup fails, the marker filename is printed so an operator
+   can remove it manually.
+
+Exit code `0` = all checks passed, `1` = at least one check failed.
+
 ### Validate file share upload
 
 ```bash
@@ -126,6 +156,42 @@ sudo /opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py --log-file
 
 # Skip the share upload even if enabled (default for zpa-siem-ctl regen)
 sudo /opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py --date 2026-04-09 --no-upload
+
+# Dry-run: parse + build sessions in memory only (no files written, no upload)
+sudo /opt/zpa-siem/venv/bin/python3 /opt/zpa-siem/report_generator.py --date 2026-04-09 --dry-run
+```
+
+Generated Excel and JSON reports are written to `/opt/zpa-siem/reports/` by default
+(configurable via `output_dir` in the `[reports]` section of `config.ini`). Files
+follow the pattern `zpa-report-YYYY-MM-DD.{xlsx,json,csv}` and are auto-pruned
+after `retention_days`.
+
+### Application log
+
+All report runs and share uploads write to a persistent log file in addition to
+stdout/journald, with a structured summary line on each run:
+
+```
+/var/log/zpa-siem/app.log    # Rotated daily, 30-day retention, gzip
+```
+
+Inspect activity:
+
+```bash
+# Live tail
+sudo tail -f /var/log/zpa-siem/app.log
+
+# Summary lines only (one per report run)
+sudo grep "event=report_complete\|event=report_failed\|event=upload_" /var/log/zpa-siem/app.log
+
+# Same content also available via journald (no rotation/retention there)
+sudo journalctl -u zpa-report.service --since today
+```
+
+Summary line format:
+```
+event=report_complete date=2026-04-09 sessions=4390 excel=zpa-report-2026-04-09.xlsx
+  csv=... json=... upload=ok|failed|skipped|disabled duration_ms=14921
 ```
 
 ## 🛠️ Development Setup
@@ -158,7 +224,8 @@ See `config/config.ini.example` for all options with documentation.
 |---------|-------------|
 | `general` | timezone, max_client_version |
 | `syslog` | port, protocol |
-| `reports` | schedule, retention_days, filename_pattern |
+| `logging` | log_dir, log_file (application log, default `/var/log/zpa-siem/app.log`) |
+| `reports` | output_dir (default `/opt/zpa-siem/reports`), schedule, retention_days, filename_pattern |
 | `dashboard` | enabled, port, username, password_hash |
 | `share` | enabled, method (smb/scp), credentials |
 
@@ -460,14 +527,15 @@ This creates a self-contained zip that can be installed on air-gapped servers wi
 
 | Issue | Check | Solution |
 |-------|-------|---------|
+| Anything looks off | `sudo zpa-siem-ctl selftest` | Single command that exercises the whole pipeline — start here |
 | Dashboard won't start | `journalctl -u zpa-dashboard -n 30` | Check Python errors in log |
 | No logs arriving | `ss -tlnp \| grep 514` | Verify rsyslog is listening |
 | Empty reports | `cat /var/log/zpa/zpa.log` | Confirm log data is flowing |
-| Report not generated | `journalctl -u zpa-report.service --since yesterday` | Check for errors, then `zpa-siem-ctl regen YYYY-MM-DD` |
+| Report not generated | `tail -100 /var/log/zpa-siem/app.log` or `journalctl -u zpa-report.service --since yesterday` | Check for errors, then `zpa-siem-ctl regen YYYY-MM-DD` |
 | Missing days | `sudo zpa-siem-ctl health` | Shows gaps, then `zpa-siem-ctl regen --all` |
 | Wrong timezone in reports | `cat /opt/zpa-siem/config.ini` | Update timezone, regenerate |
 | VM noise in reports | Config: `max_client_version` | Set to expected max major (e.g., `10`) |
-| Share upload fails | `sudo zpa-siem-ctl test-share` | Read the printed `scp`/`smbclient` error message |
+| Share upload fails | `sudo zpa-siem-ctl test-share` | Read the printed `scp`/`smbclient` error message (also logged to `/var/log/zpa-siem/app.log` with `event=upload_failed`) |
 | `sshpass: command not found` | SCP password mode without sshpass | `sudo dnf install epel-release && sudo dnf install sshpass`, or re-run `install.sh --configure` |
 
 ### Debug a report manually

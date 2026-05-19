@@ -5,12 +5,14 @@ Commands:
     health        Check for missing reports vs available log files
     regen         Regenerate the report for a specific date (no auto-upload)
     test-share    Upload a file to the configured share to validate connectivity
+    selftest      End-to-end production smoke test (no side effects)
 
 Usage:
     zpa-siem-ctl health [--days N]
     zpa-siem-ctl regen YYYY-MM-DD
     zpa-siem-ctl regen --all [--force]
     zpa-siem-ctl test-share [--file PATH]
+    zpa-siem-ctl selftest [--date YYYY-MM-DD] [--skip-share]
 """
 
 import argparse
@@ -23,6 +25,9 @@ import tempfile
 from datetime import datetime, timedelta
 
 from config import Config
+from app_logger import setup_logging, get_logger
+
+log = get_logger(__name__)
 
 
 def find_log_dates(log_dir: str) -> set[str]:
@@ -266,7 +271,7 @@ def cmd_test_share(args, config: Config) -> int:
     print(f"Uploading: {os.path.basename(upload_path)} ({source})")
 
     # Import lazily so help/-h works without the dependency tree
-    from share_upload import upload_report
+    from share_upload import upload_report, delete_remote
     success, msg = upload_report(upload_path, config)
 
     if cleanup:
@@ -274,12 +279,164 @@ def cmd_test_share(args, config: Config) -> int:
             os.unlink(cleanup)
         except OSError:
             pass
+        # Also try to remove the auto-generated marker from the remote share
+        if success:
+            removed, rmsg = delete_remote(os.path.basename(upload_path), config)
+            if removed:
+                print(f"Remote cleanup: {rmsg}")
+            else:
+                print(f"Remote cleanup skipped: {rmsg}", file=sys.stderr)
 
     if success:
         print(f"OK: {msg}")
         return 0
     print(f"FAILED: {msg}", file=sys.stderr)
     return 1
+
+
+def cmd_selftest(args, config: Config) -> int:
+    """Production smoke test — verifies the whole pipeline without leaving artifacts.
+
+    Steps:
+      1. Config readable and required sections present
+      2. App log directory writable (write + read back a marker line)
+      3. Syslog source directory readable + at least one zpa.log* present
+      4. Dry-run report generation on yesterday (or --date): parse + build sessions
+         without writing any output file or attempting an upload
+      5. Share connectivity (if enabled): upload a tiny marker file and remove it
+         from the remote share (best-effort cleanup)
+
+    Exit code 0 = all checks passed. Non-zero = at least one check failed.
+    """
+    failures: list[str] = []
+
+    def step(name: str, ok: bool, detail: str = ""):
+        marker = "OK  " if ok else "FAIL"
+        print(f"  [{marker}] {name}{(' — ' + detail) if detail else ''}")
+        if not ok:
+            failures.append(name)
+
+    print("ZPA Status Mini-SIEM — selftest")
+    print(f"  Config: {config.path}")
+    print()
+
+    # 1. Config sanity
+    print("Config:")
+    try:
+        _ = config.log_dir
+        _ = config.output_dir
+        _ = config.timezone_name
+        step("config readable", True, f"timezone={config.timezone_name}")
+    except Exception as exc:
+        step("config readable", False, str(exc))
+
+    # 2. App log writability
+    print("\nApp log:")
+    log_path = os.path.join(config.app_log_dir, config.app_log_file)
+    marker = f"selftest marker {datetime.now().strftime('%Y%m%dT%H%M%S')}"
+    try:
+        os.makedirs(config.app_log_dir, exist_ok=True)
+        log.info("selftest: %s", marker)
+        for h in log.parent.handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+        with open(log_path, "r", encoding="utf-8") as f:
+            tail = f.read()[-4096:]
+        step(
+            f"writable {log_path}",
+            marker in tail,
+            "marker round-trip OK" if marker in tail else "marker not found in tail",
+        )
+    except OSError as exc:
+        step(f"writable {log_path}", False, str(exc))
+
+    # 3. Syslog source
+    print("\nLog source:")
+    log_dir = config.log_dir
+    if not os.path.isdir(log_dir):
+        step(f"directory {log_dir}", False, "missing")
+    else:
+        files = sorted(glob.glob(os.path.join(log_dir, "zpa.log*")))
+        readable = [p for p in files if os.access(p, os.R_OK)]
+        step(
+            f"directory {log_dir}",
+            bool(readable),
+            f"{len(readable)}/{len(files)} files readable"
+            if files else "no zpa.log* files present (no ZPA traffic yet?)",
+        )
+
+    # 4. Dry-run report generation (no files written, no upload)
+    print("\nReport pipeline (dry-run):")
+    target_date = args.date or (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    generator = os.path.join(script_dir, "report_generator.py")
+    if not os.path.exists(generator):
+        step("dry-run report", False, f"generator not found: {generator}")
+    else:
+        cmd = [
+            sys.executable, generator,
+            "--date", target_date,
+            "--dry-run",
+            "--log-dir", log_dir,
+            "--output-dir", config.output_dir,
+        ]
+        if args.config:
+            cmd += ["--config", args.config]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        ok = result.returncode == 0
+        # Show a few key lines from stdout
+        for line in (result.stdout or "").strip().splitlines()[-6:]:
+            print(f"      {line}")
+        if not ok:
+            for line in (result.stderr or "").strip().splitlines()[-6:]:
+                print(f"      {line}", file=sys.stderr)
+        step(f"dry-run report for {target_date}", ok,
+             f"exit={result.returncode}")
+
+    # 5. Share upload + remote cleanup
+    print("\nShare upload:")
+    if not config.share_enabled:
+        print("  [SKIP] share upload disabled in config")
+    elif args.skip_share:
+        print("  [SKIP] --skip-share flag set")
+    else:
+        from share_upload import upload_report, delete_remote
+        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=f"-zpa-siem-selftest-{ts}.txt", delete=False,
+        )
+        tmp.write(f"ZPA SIEM selftest {ts}\n")
+        tmp.close()
+        try:
+            uploaded, umsg = upload_report(tmp.name, config)
+            step("upload marker", uploaded, umsg)
+            if uploaded:
+                removed, rmsg = delete_remote(os.path.basename(tmp.name), config)
+                # Remote cleanup failure does NOT fail the selftest — it's
+                # best-effort. We surface the message so the operator can act.
+                if removed:
+                    print(f"  [OK  ] remote cleanup — {rmsg}")
+                else:
+                    print(f"  [WARN] remote cleanup left marker behind — {rmsg}")
+                    print(f"         (please remove '{os.path.basename(tmp.name)}' manually)")
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+    print()
+    if failures:
+        print(f"SELFTEST FAILED: {len(failures)} check(s) failed:")
+        for name in failures:
+            print(f"  - {name}")
+        log.error("event=selftest_failed checks_failed=%d", len(failures))
+        return 1
+    print("SELFTEST OK — all checks passed.")
+    log.info("event=selftest_ok")
+    return 0
 
 
 def main():
@@ -311,12 +468,23 @@ def main():
     test_p.add_argument("--file", default=None,
                         help="Specific file to upload (default: newest report in output_dir, or auto-generated test file)")
 
+    # selftest
+    selftest_p = sub.add_parser(
+        "selftest",
+        help="Production smoke test: config, log writability, log source, dry-run report, share connectivity",
+    )
+    selftest_p.add_argument("--date", default=None,
+                            help="Date to dry-run (default: yesterday)")
+    selftest_p.add_argument("--skip-share", action="store_true",
+                            help="Skip the share connectivity check even if enabled")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         return 1
 
     config = Config(args.config)
+    setup_logging(config.app_log_dir, config.app_log_file)
 
     if args.command == "health":
         return cmd_health(args, config)
@@ -324,6 +492,8 @@ def main():
         return cmd_regen(args, config)
     elif args.command == "test-share":
         return cmd_test_share(args, config)
+    elif args.command == "selftest":
+        return cmd_selftest(args, config)
 
 
 if __name__ == "__main__":
