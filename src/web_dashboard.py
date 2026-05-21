@@ -6,6 +6,8 @@ searching by username, and downloading Excel files. Protected by basic auth
 over HTTPS with a self-signed certificate.
 """
 
+from __future__ import annotations
+
 import errno
 import fcntl
 import json
