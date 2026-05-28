@@ -38,8 +38,8 @@ Organizations using Zscaler Private Access need visibility into user session act
 |-----------|-------------|
 | **rsyslog** | Receives ZPA syslog on TCP/514, writes to `/var/log/zpa/` |
 | **logrotate** | Daily rotation, 30-day retention, gzip compression |
-| **report_generator.py** | Parses logs, consolidates sessions, generates Excel + JSON |
-| **web_dashboard.py** | Flask HTTPS dashboard with auth, browse, search, download, on-demand partial-report generation |
+| **report_generator.py** | Streams logs (line-by-line, pre-filter before `json.loads`), consolidates sessions via per-SID accumulators, writes Excel/JSON/CSV + a small `.summary.json` sidecar for the dashboard |
+| **web_dashboard.py** | Flask HTTPS dashboard with auth, browse, search, download, on-demand partial-report generation. Reads sidecars to render the index without parsing multi-MB JSON files |
 | **share_upload.py** | Uploads reports to SMB/CIFS or SCP shares |
 | **zpa_siem_ctl.py** | Management CLI: health checks, report regeneration, share upload test |
 | **install.sh** | Interactive installer for RHEL 9/10 |
@@ -90,11 +90,22 @@ sudo zpa-siem-ctl regen --all
 
 # Force-rebuild every day, including those that already have a report
 sudo zpa-siem-ctl regen --all --force
+
+# Build dashboard sidecars for reports created before the sidecar feature
+# (idempotent — existing sidecars are kept unless --force is passed)
+sudo zpa-siem-ctl reindex
+sudo zpa-siem-ctl reindex --force
 ```
 
 > **Note:** `regen` never auto-uploads to the configured file share. Only the
 > daily systemd timer pushes reports. Use `test-share` (below) to validate
 > connectivity, or upload manually if you need to push a regenerated report.
+
+> **Note:** Every freshly generated report writes a small `{date}.summary.json`
+> sidecar (a few KB containing the username list and session count). The
+> dashboard reads sidecars to render the index and to pre-filter searches
+> without loading the full multi-MB report payload. Run `reindex` once after
+> upgrading to populate sidecars for older reports already on disk.
 
 ### Production smoke test (selftest)
 
@@ -302,6 +313,28 @@ In the ZPA Admin Portal, configure the NSS feed **Log Stream Content** with this
 ```
 
 > **Path**: ZPA Admin Portal > Configuration > Log Receivers > edit feed > Log Stream Content
+
+## 🧠 Memory model
+
+The report generator was designed for VMs with limited RAM facing large-scale
+ZPA deployments (10k+ users, tens of millions of log records per day):
+
+- Log files are read **line-by-line**; lines that do not contain the
+  `zpn_client_type_zapp` marker are dropped before `json.loads`, avoiding
+  the dict allocation entirely.
+- Records are streamed through generators — no intermediate `list[dict]` of
+  all records is ever materialised.
+- Session consolidation keeps one slim accumulator (`__slots__` class) per
+  `SessionID`, not the raw event list. Peak RAM scales with the number of
+  distinct sessions (tens of thousands), not raw events (millions).
+- Excel output uses openpyxl's write-only mode; JSON output is written
+  row-by-row; CSV streams via `csv.DictWriter`.
+- The dashboard reads `{date}.summary.json` sidecars to render the index and
+  to pre-filter username searches, avoiding multi-MB JSON loads on every
+  request.
+
+Measured peak RSS on a real two-file day of logs (~1.4M records, 4.4k user
+sessions): **~62 MB**.
 
 ## 📊 Session Processing Logic
 

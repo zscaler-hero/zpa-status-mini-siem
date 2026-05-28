@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import glob
+import json
 import os
 import re
 import subprocess
@@ -294,6 +295,72 @@ def cmd_test_share(args, config: Config) -> int:
     return 1
 
 
+def cmd_reindex(args, config: Config) -> int:
+    """Generate the dashboard `{date}.summary.json` sidecar for existing reports.
+
+    The dashboard reads sidecars to render the index and to pre-filter username
+    searches without loading the full report JSON. This command catches up the
+    sidecars for reports produced before sidecar generation was wired in.
+    Idempotent — existing sidecars are kept unless --force is passed.
+    """
+    output_dir = args.output_dir or config.output_dir
+    if not os.path.isdir(output_dir):
+        print(f"ERROR: output dir not found: {output_dir}", file=sys.stderr)
+        return 1
+
+    date_re = re.compile(r"(\d{4}-\d{2}-\d{2})")
+    files = sorted(os.listdir(output_dir))
+    targets = []
+    for fname in files:
+        if not fname.endswith(".json") or fname.endswith(".summary.json"):
+            continue
+        m = date_re.search(fname)
+        if not m:
+            continue
+        targets.append((m.group(1), fname))
+
+    if not targets:
+        print(f"No reports found in {output_dir}")
+        return 0
+
+    done, skipped, errors = 0, 0, 0
+    for d, fname in targets:
+        sidecar_name = fname[:-len(".json")] + ".summary.json"
+        sidecar_path = os.path.join(output_dir, sidecar_name)
+        if os.path.exists(sidecar_path) and not args.force:
+            skipped += 1
+            continue
+        try:
+            with open(os.path.join(output_dir, fname), encoding="utf-8") as f:
+                data = json.load(f)
+            sessions = data.get("sessions", [])
+            usernames = sorted({
+                s.get("username", "") for s in sessions if s.get("username")
+            })
+            base = fname[:-len(".json")]
+            summary = {
+                "date": d,
+                "session_count": len(sessions),
+                "has_csv": os.path.exists(os.path.join(output_dir, base + ".csv")),
+                "has_xlsx": os.path.exists(os.path.join(output_dir, base + ".xlsx")),
+                "usernames": usernames,
+                "generated_at": data.get(
+                    "generated_at",
+                    datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                ),
+            }
+            with open(sidecar_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False)
+            print(f"  {d}: wrote {sidecar_name} ({len(usernames)} usernames)")
+            done += 1
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"  {d}: ERROR — {exc}", file=sys.stderr)
+            errors += 1
+
+    print(f"\nReindex done: {done} generated, {skipped} skipped, {errors} errors")
+    return 1 if errors else 0
+
+
 def cmd_selftest(args, config: Config) -> int:
     """Production smoke test — verifies the whole pipeline without leaving artifacts.
 
@@ -468,6 +535,14 @@ def main():
     test_p.add_argument("--file", default=None,
                         help="Specific file to upload (default: newest report in output_dir, or auto-generated test file)")
 
+    # reindex
+    reindex_p = sub.add_parser(
+        "reindex",
+        help="Generate dashboard summary sidecars for existing reports (idempotent)",
+    )
+    reindex_p.add_argument("--force", action="store_true",
+                           help="Regenerate sidecars even when they already exist")
+
     # selftest
     selftest_p = sub.add_parser(
         "selftest",
@@ -492,6 +567,8 @@ def main():
         return cmd_regen(args, config)
     elif args.command == "test-share":
         return cmd_test_share(args, config)
+    elif args.command == "reindex":
+        return cmd_reindex(args, config)
     elif args.command == "selftest":
         return cmd_selftest(args, config)
 

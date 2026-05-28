@@ -32,6 +32,12 @@ reports/*.xlsx
 reports/*.json
 reports/*.csv
 
+# Test fixtures and golden files are derived from real ZPA logs and
+# contain client PII (usernames, IPs, hostnames). Keep local-only; see
+# tests/README.md for how to regenerate them on a dev machine.
+tests/fixtures/
+tests/golden/
+
 # OS
 .DS_Store
 Thumbs.db

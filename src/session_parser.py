@@ -2,6 +2,12 @@
 
 Parses ZPA syslog files, extracts user sessions, filters auth probes,
 and merges consecutive sessions caused by ZPA SessionID rotation.
+
+The pipeline is streaming end-to-end: log files are read line-by-line,
+non-user records are skipped before json.loads, and the per-session state
+is kept in a slim accumulator (`_SessionAcc` with __slots__) keyed by
+SessionID. This keeps peak RAM proportional to the number of distinct
+sessions (~tens of thousands), not the number of raw events (~millions).
 """
 
 import gzip
@@ -9,12 +15,17 @@ import ipaddress
 import json
 from collections import defaultdict
 from datetime import datetime
-from typing import Optional
+from typing import Iterable, Iterator, Optional
 from zoneinfo import ZoneInfo
 
 MIN_SESSION_DURATION_SECONDS = 5
 SESSION_MERGE_GAP_SECONDS = 60
 USER_CLIENT_TYPE = "zpn_client_type_zapp"
+# Substring searched on the raw line before json.loads. If absent, the line
+# is dropped without ever allocating a Python dict. Reflects the canonical
+# ZPA payload shape "<key>": "<value>".
+_ZAPP_MARKER = '"ClientType": "zpn_client_type_zapp"'
+_ZAPP_MARKER_COMPACT = '"ClientType":"zpn_client_type_zapp"'
 
 REPORT_COLUMNS = [
     "Username",
@@ -59,8 +70,40 @@ def parse_log_line(line: str) -> Optional[dict]:
         return None
 
 
-def parse_log_file(path: str) -> list[dict]:
-    """Read a log file (plain or gzipped) and return all valid JSON records."""
+def iter_log_records(path: str) -> Iterator[dict]:
+    """Yield parsed JSON records from a log file (plain or gzipped).
+
+    Lines that do not contain the user-session client type marker are dropped
+    before json.loads, avoiding the dict allocation entirely. ZPA emits the
+    marker in two equivalent shapes ("ClientType": "..." and "ClientType":"...")
+    depending on the template; both are recognised.
+
+    UTF-8 with errors="replace" matches the legacy parse_log_file behaviour —
+    ZPA writes literal multi-byte sequences (e.g. "Forlì") rather than \\uXXXX
+    escapes, so a non-UTF-8 codec would mojibake the City/Username fields.
+    """
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, mode="rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if _ZAPP_MARKER not in line and _ZAPP_MARKER_COMPACT not in line:
+                continue
+            idx = line.find("{")
+            if idx == -1:
+                continue
+            try:
+                yield json.loads(line[idx:])
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+
+def parse_log_file(path: str) -> list:
+    """Read a log file (plain or gzipped) and return all valid JSON records.
+
+    Legacy entry point kept for backward compatibility. Materialises the full
+    record list — use `iter_log_records` for new code to stay memory-bounded.
+    Unlike `iter_log_records`, this function does NOT pre-filter by ClientType:
+    it returns every JSON-parseable line, matching the historical behaviour.
+    """
     records = []
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, mode="rt", errors="replace") as f:
@@ -91,9 +134,134 @@ def _version_major(version: str) -> Optional[int]:
         return None
 
 
-def build_sessions(records: list[dict], tz: ZoneInfo,
-                   max_client_version: int = 0) -> list[dict]:
-    """Group records by SessionID and build consolidated session rows.
+class _SessionAcc:
+    """Per-SessionID accumulator. Replaces the old list-of-raw-records group-by.
+
+    Memory: a few hundred bytes per session vs ~4 KB per raw event. With
+    ~50k distinct SessionIDs per day, the whole state fits in tens of MB.
+
+    Semantics replicate the historical build_sessions logic exactly:
+      - `first_*` snapshot taken from the first record ever seen for the SID
+        (the original `first = events[0]`).
+      - `last_*` updated on every record while the session is not frozen.
+      - When the first ZPN_STATUS_DISCONNECTED arrives, `unauth_ts` is set,
+        `last_*` is overwritten with that record's fields, and `frozen` is
+        marked True — further records for this SID are ignored (the original
+        loop used `break` after finding the first DISCONNECTED).
+    """
+
+    __slots__ = (
+        "username",
+        "first_auth_ts",
+        "frozen",
+        "unauth_ts",
+        "last_pub",
+        "last_priv",
+        "last_city",
+        "last_country",
+        "last_device",
+        "last_platform",
+        "last_version",
+        "last_trusted",
+        "last_bytes_rx",
+        "last_bytes_tx",
+    )
+
+    def __init__(self, rec: dict, auth_ts: datetime):
+        self.username = rec.get("Username", "")
+        self.first_auth_ts = auth_ts
+        self.frozen = False
+        self.unauth_ts: Optional[datetime] = None
+        # Funnel the first record through ingest() so the DISCONNECTED-handling
+        # path is unified. Otherwise a SessionID whose only record is a stray
+        # DISCONNECTED would slip through as "In corso", whereas the legacy
+        # code treats it as a sub-second session and discards it via the
+        # MIN_SESSION_DURATION filter.
+        self.ingest(rec)
+
+    def _update_last(self, rec: dict) -> None:
+        self.last_pub = rec.get("PublicIP", "")
+        self.last_priv = rec.get("PrivateIP", "")
+        self.last_city = rec.get("City", "")
+        self.last_country = rec.get("CountryCode", "")
+        self.last_device = rec.get("Hostname", "")
+        self.last_platform = rec.get("Platform", "")
+        self.last_version = rec.get("Version", "")
+        self.last_trusted = rec.get("TrustedNetworksNames", [])
+        self.last_bytes_rx = rec.get("TotalBytesRx", 0)
+        self.last_bytes_tx = rec.get("TotalBytesTx", 0)
+
+    def ingest(self, rec: dict) -> None:
+        """Apply one more record to this accumulator."""
+        if self.frozen:
+            return
+        if rec.get("SessionStatus") == "ZPN_STATUS_DISCONNECTED":
+            unauth = parse_timestamp(rec.get("TimestampUnAuthentication", ""))
+            self.unauth_ts = unauth
+            self._update_last(rec)
+            self.frozen = True
+        else:
+            self._update_last(rec)
+
+
+def _emit_row(sid: str, acc: _SessionAcc, tz: ZoneInfo) -> Optional[dict]:
+    """Build the session-row dict (pre-merge, pre-finalize) from an accumulator.
+
+    Returns None for sessions that should be discarded (e.g. duration below
+    the auth-probe threshold).
+    """
+    auth_local = acc.first_auth_ts.astimezone(tz)
+
+    if acc.unauth_ts:
+        duration_sec = (acc.unauth_ts - acc.first_auth_ts).total_seconds()
+        if duration_sec < MIN_SESSION_DURATION_SECONDS:
+            return None
+        duration_str = format_duration(duration_sec)
+        unauth_local = acc.unauth_ts.astimezone(tz)
+        end_str = unauth_local.strftime("%H:%M:%S")
+    else:
+        duration_str = "In corso"
+        end_str = "In corso"
+        unauth_local = None
+
+    trusted_str = ", ".join(acc.last_trusted) if acc.last_trusted else ""
+
+    version = acc.last_version
+    parts = version.split(".")
+    if len(parts) > 4:
+        version = ".".join(parts[:4])
+
+    return {
+        "Username": acc.username,
+        "Date": auth_local.strftime("%Y-%m-%d"),
+        "Session Start": auth_local.strftime("%H:%M:%S"),
+        "Session End": end_str,
+        "Duration": duration_str,
+        "Public IP": acc.last_pub,
+        "Private IP": acc.last_priv,
+        "City": acc.last_city,
+        "Country": acc.last_country,
+        "Device": acc.last_device,
+        "Platform": acc.last_platform,
+        "Client Version": version,
+        "Trusted Network": trusted_str,
+        "Bytes Rx": acc.last_bytes_rx,
+        "Bytes Tx": acc.last_bytes_tx,
+        "_start_dt": auth_local,
+        "_end_dt": unauth_local,
+        "_session_ids": [sid],
+        "_ip_history": [(auth_local, unauth_local, acc.last_pub, acc.last_priv,
+                         acc.last_city, acc.last_country)],
+    }
+
+
+def build_sessions(records: Iterable[dict], tz: ZoneInfo,
+                   max_client_version: int = 0) -> list:
+    """Stream-consume `records` and build consolidated session rows.
+
+    `records` is any iterable of parsed log records (list, generator, chain).
+    The function never materialises the input — peak RAM is proportional to
+    the number of distinct SessionIDs, not the total record count.
 
     Filters:
     - Only zpn_client_type_zapp (real user sessions)
@@ -102,7 +270,7 @@ def build_sessions(records: list[dict], tz: ZoneInfo,
 
     Timestamps are converted from UTC to the given timezone for display.
     """
-    grouped = defaultdict(list)
+    state: "dict[str, _SessionAcc]" = {}
 
     for rec in records:
         if rec.get("ClientType") != USER_CLIENT_TYPE:
@@ -114,74 +282,21 @@ def build_sessions(records: list[dict], tz: ZoneInfo,
         sid = rec.get("SessionID")
         if not sid:
             continue
-        grouped[sid].append(rec)
+
+        acc = state.get(sid)
+        if acc is None:
+            auth_ts = parse_timestamp(rec.get("TimestampAuthentication", ""))
+            if not auth_ts:
+                continue
+            state[sid] = _SessionAcc(rec, auth_ts)
+        else:
+            acc.ingest(rec)
 
     sessions = []
-    for sid, events in grouped.items():
-        last = events[-1]
-        first = events[0]
-
-        username = first.get("Username", "")
-        auth_ts = parse_timestamp(first.get("TimestampAuthentication", ""))
-
-        if not auth_ts:
-            continue
-
-        unauth_ts = None
-        for e in events:
-            if e.get("SessionStatus") == "ZPN_STATUS_DISCONNECTED":
-                unauth_ts = parse_timestamp(e.get("TimestampUnAuthentication", ""))
-                last = e
-                break
-
-        auth_local = auth_ts.astimezone(tz)
-
-        if unauth_ts:
-            duration_sec = (unauth_ts - auth_ts).total_seconds()
-            if duration_sec < MIN_SESSION_DURATION_SECONDS:
-                continue
-            duration_str = format_duration(duration_sec)
-            unauth_local = unauth_ts.astimezone(tz)
-            end_str = unauth_local.strftime("%H:%M:%S")
-        else:
-            duration_str = "In corso"
-            end_str = "In corso"
-
-        trusted = last.get("TrustedNetworksNames", [])
-        trusted_str = ", ".join(trusted) if trusted else ""
-
-        version = last.get("Version", "")
-        parts = version.split(".")
-        if len(parts) > 4:
-            version = ".".join(parts[:4])
-
-        unauth_local = unauth_ts.astimezone(tz) if unauth_ts else None
-
-        public_ip = last.get("PublicIP", "")
-        private_ip = last.get("PrivateIP", "")
-        city = last.get("City", "")
-        country = last.get("CountryCode", "")
-        sessions.append({
-            "Username": username,
-            "Date": auth_local.strftime("%Y-%m-%d"),
-            "Session Start": auth_local.strftime("%H:%M:%S"),
-            "Session End": end_str,
-            "Duration": duration_str,
-            "Public IP": public_ip,
-            "Private IP": private_ip,
-            "City": city,
-            "Country": country,
-            "Device": last.get("Hostname", ""),
-            "Platform": last.get("Platform", ""),
-            "Client Version": version,
-            "Trusted Network": trusted_str,
-            "Bytes Rx": last.get("TotalBytesRx", 0),
-            "Bytes Tx": last.get("TotalBytesTx", 0),
-            "_start_dt": auth_local,
-            "_end_dt": unauth_local,
-            "_session_ids": [sid],
-            "_ip_history": [(auth_local, unauth_local, public_ip, private_ip, city, country)],
-        })
+    for sid, acc in state.items():
+        row = _emit_row(sid, acc, tz)
+        if row is not None:
+            sessions.append(row)
 
     sessions.sort(key=lambda s: (s["Username"], s["Date"], s["Session Start"]))
     sessions = merge_sessions(sessions)
@@ -237,7 +352,7 @@ def _can_merge(current: dict, s: dict, gap_sec: float) -> bool:
     return False
 
 
-def merge_sessions(sessions: list[dict]) -> list[dict]:
+def merge_sessions(sessions: list) -> list:
     """Merge consecutive sessions for the same user/date.
 
     ZPA emits multiple overlapping SessionIDs per physical user session
@@ -325,10 +440,10 @@ def _finalize_row(row: dict) -> None:
     sorted_hist = sorted(history, key=lambda h: h[0])
     n = len(sorted_hist)
 
-    public_durations: dict[str, float] = defaultdict(float)
-    private_durations: dict[str, float] = defaultdict(float)
-    public_to_geo: dict[str, tuple[str, str]] = {}
-    seg_durations: list[float] = []
+    public_durations: "dict[str, float]" = defaultdict(float)
+    private_durations: "dict[str, float]" = defaultdict(float)
+    public_to_geo: "dict[str, tuple]" = {}
+    seg_durations: list = []
 
     for i, (start, end, pub, priv, city, country) in enumerate(sorted_hist):
         if i + 1 < n:

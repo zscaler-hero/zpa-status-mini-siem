@@ -21,10 +21,11 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from session_parser import REPORT_COLUMNS, build_sessions, parse_log_file, parse_timestamp
+from session_parser import REPORT_COLUMNS, build_sessions, iter_log_records, parse_timestamp
 from config import Config
 from app_logger import setup_logging, get_logger
 
@@ -34,11 +35,17 @@ log = get_logger(__name__)
 # --- Excel generation ---
 
 
-def generate_excel(sessions: list[dict], output_path: str) -> None:
-    """Generate the Excel report from consolidated sessions."""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "ZPA Sessions"
+def generate_excel(sessions: list, output_path: str) -> None:
+    """Generate the Excel report from consolidated sessions.
+
+    Uses openpyxl's write-only mode: rows are streamed straight to the XLSX
+    archive without keeping the whole sheet in memory, and column widths are
+    accumulated during the single append pass (replacing the legacy second
+    iter_rows traversal). Output is functionally identical to the legacy
+    generator: same headers, same styles, same freeze_panes and auto_filter.
+    """
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet(title="ZPA Sessions")
 
     header_font = Font(bold=True, color="FFFFFF", size=11)
     header_fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
@@ -50,35 +57,49 @@ def generate_excel(sessions: list[dict], output_path: str) -> None:
         bottom=Side(style="thin"),
     )
     active_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    # Pre-build per-column data alignments (one object reused per column
+    # across all data rows — cheaper than constructing one per cell).
+    data_alignments = [
+        Alignment(horizontal="center" if col_name != "Username" else "left")
+        for col_name in REPORT_COLUMNS
+    ]
 
-    for col_idx, col_name in enumerate(REPORT_COLUMNS, 1):
-        cell = ws.cell(row=1, column=col_idx, value=col_name)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_alignment
-        cell.border = thin_border
+    max_widths = [len(c) for c in REPORT_COLUMNS]
 
-    for row_idx, session in enumerate(sessions, 2):
+    header_cells = []
+    for col_name in REPORT_COLUMNS:
+        c = WriteOnlyCell(ws, value=col_name)
+        c.font = header_font
+        c.fill = header_fill
+        c.alignment = header_alignment
+        c.border = thin_border
+        header_cells.append(c)
+    ws.append(header_cells)
+
+    row_count = 0
+    for session in sessions:
         is_active = session["Session End"] == "In corso"
-        for col_idx, col_name in enumerate(REPORT_COLUMNS, 1):
+        row_cells = []
+        for i, col_name in enumerate(REPORT_COLUMNS):
             value = session[col_name]
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
-            cell.border = thin_border
-            cell.alignment = Alignment(horizontal="center" if col_name != "Username" else "left")
+            c = WriteOnlyCell(ws, value=value)
+            c.border = thin_border
+            c.alignment = data_alignments[i]
             if is_active:
-                cell.fill = active_fill
+                c.fill = active_fill
+            row_cells.append(c)
+            if value:
+                ln = len(str(value))
+                if ln > max_widths[i]:
+                    max_widths[i] = ln
+        ws.append(row_cells)
+        row_count += 1
 
-    for col_idx in range(1, len(REPORT_COLUMNS) + 1):
-        col_letter = get_column_letter(col_idx)
-        max_len = len(REPORT_COLUMNS[col_idx - 1])
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=col_idx, max_col=col_idx):
-            for cell in row:
-                if cell.value:
-                    max_len = max(max_len, len(str(cell.value)))
-        ws.column_dimensions[col_letter].width = min(max_len + 3, 40)
+    for i, w in enumerate(max_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = min(w + 3, 40)
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(REPORT_COLUMNS))}{ws.max_row}"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(REPORT_COLUMNS))}{row_count + 1}"
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     wb.save(output_path)
@@ -98,39 +119,83 @@ def generate_csv(sessions: list[dict], output_path: str) -> None:
         writer.writerows(sessions)
 
 
-def generate_json(sessions: list[dict], output_path: str, timezone_name: str) -> None:
-    """Generate the JSON report from consolidated sessions."""
-    report = {
-        "report_date": sessions[0]["Date"] if sessions else "",
-        "timezone": timezone_name,
-        "generated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-        "sessions": [
-            {
-                "username": s["Username"],
-                "date": s["Date"],
-                "session_start": s["Session Start"],
-                "session_end": s["Session End"],
-                "duration": s["Duration"],
-                "main_public_ip": s["Main Public IP"],
-                "other_public_ips": [ip for ip in s["Other Public IPs"].split(", ") if ip],
-                "main_private_ip": s["Main Private IP"],
-                "other_private_ips": [ip for ip in s["Other Private IPs"].split(", ") if ip],
-                "city": s["City"],
-                "country": s["Country"],
-                "device": s["Device"],
-                "platform": s["Platform"],
-                "client_version": s["Client Version"],
-                "trusted_network": s["Trusted Network"],
-                "bytes_rx": s["Bytes Rx"],
-                "bytes_tx": s["Bytes Tx"],
-                "session_ids": s.get("_session_ids", []),
-            }
-            for s in sessions
-        ],
+def _session_to_json_row(s: dict) -> dict:
+    return {
+        "username": s["Username"],
+        "date": s["Date"],
+        "session_start": s["Session Start"],
+        "session_end": s["Session End"],
+        "duration": s["Duration"],
+        "main_public_ip": s["Main Public IP"],
+        "other_public_ips": [ip for ip in s["Other Public IPs"].split(", ") if ip],
+        "main_private_ip": s["Main Private IP"],
+        "other_private_ips": [ip for ip in s["Other Private IPs"].split(", ") if ip],
+        "city": s["City"],
+        "country": s["Country"],
+        "device": s["Device"],
+        "platform": s["Platform"],
+        "client_version": s["Client Version"],
+        "trusted_network": s["Trusted Network"],
+        "bytes_rx": s["Bytes Rx"],
+        "bytes_tx": s["Bytes Tx"],
+        "session_ids": s.get("_session_ids", []),
     }
+
+
+def generate_json(sessions: list, output_path: str, timezone_name: str) -> None:
+    """Generate the JSON report from consolidated sessions.
+
+    Writes incrementally: one session row is serialised and flushed at a time
+    instead of building the full report dict in memory. Output layout matches
+    the legacy `json.dump(report, f, indent=2)` exactly (2-space indent).
+    """
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
+    report_date = sessions[0]["Date"] if sessions else ""
+    generated_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("{\n")
+        f.write(f'  "report_date": {json.dumps(report_date, ensure_ascii=False)},\n')
+        f.write(f'  "timezone": {json.dumps(timezone_name, ensure_ascii=False)},\n')
+        f.write(f'  "generated_at": {json.dumps(generated_at, ensure_ascii=False)},\n')
+        if not sessions:
+            f.write('  "sessions": []\n}')
+            return
+        f.write('  "sessions": [\n')
+        last_idx = len(sessions) - 1
+        for i, s in enumerate(sessions):
+            row = _session_to_json_row(s)
+            # Serialise the row at top-level indent=2, then shift every line
+            # right by 4 spaces so it sits two levels deep inside the document
+            # (matching what json.dump(report, indent=2) would have produced).
+            row_str = json.dumps(row, indent=2, ensure_ascii=False)
+            indented = "\n".join("    " + line for line in row_str.split("\n"))
+            f.write(indented)
+            f.write(",\n" if i != last_idx else "\n")
+        f.write("  ]\n}")
+
+
+def generate_summary_sidecar(sessions: list, output_path: str,
+                             report_date: str,
+                             has_csv: bool, has_xlsx: bool) -> None:
+    """Write a small `{date}.summary.json` next to the full report.
+
+    The dashboard reads sidecars to render the report index and to pre-filter
+    candidate dates for username search without ever loading the full JSON
+    payload (which can be hundreds of MB at 15k-user scale). Schema is kept
+    minimal: only what the dashboard actually consumes.
+    """
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    usernames = sorted({s["Username"] for s in sessions if s.get("Username")})
+    summary = {
+        "date": report_date,
+        "session_count": len(sessions),
+        "has_csv": has_csv,
+        "has_xlsx": has_xlsx,
+        "usernames": usernames,
+        "generated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False)
 
 
 # --- Retention cleanup ---
@@ -276,29 +341,31 @@ def main():
 
     log.info("Report date: %s", report_date)
 
-    # Read records from all candidate files
-    all_records = []
-    for lp in log_paths:
-        recs = parse_log_file(lp)
-        log.info("  %s: %d records", os.path.basename(lp), len(recs))
-        all_records.extend(recs)
-    log.info("  Total records: %d", len(all_records))
-
-    # Filter to only the target date (midnight to midnight in local tz)
+    # Streaming pipeline: read line-by-line, pre-filter zapp records before
+    # json.loads, drop out-of-window timestamps without materialising any
+    # intermediate list. Peak RAM is dominated by the per-SID accumulator
+    # state in build_sessions, not by the raw record count.
     day_start = datetime(*(int(x) for x in report_date.split("-")), tzinfo=tz) \
         .astimezone(ZoneInfo("UTC"))
     day_end = day_start + timedelta(days=1)
-    records = []
-    for rec in all_records:
-        ts = parse_timestamp(rec.get("TimestampAuthentication", ""))
-        if ts and day_start <= ts < day_end:
-            records.append(rec)
-    log.info("  After date filter (%s): %d", report_date, len(records))
+
+    def _date_filtered_records():
+        for lp in log_paths:
+            n_in = 0
+            n_kept = 0
+            for rec in iter_log_records(lp):
+                n_in += 1
+                ts = parse_timestamp(rec.get("TimestampAuthentication", ""))
+                if ts and day_start <= ts < day_end:
+                    n_kept += 1
+                    yield rec
+            log.info("  %s: %d zapp records (%d in window)",
+                     os.path.basename(lp), n_in, n_kept)
 
     max_ver = config.max_client_version
     if max_ver > 0:
         log.info("  Version filter: major <= %d", max_ver)
-    sessions = build_sessions(records, tz, max_client_version=max_ver)
+    sessions = build_sessions(_date_filtered_records(), tz, max_client_version=max_ver)
     log.info("  User sessions (after filtering): %d", len(sessions))
 
     if not sessions:
@@ -339,6 +406,16 @@ def main():
     json_path = os.path.splitext(excel_path)[0] + ".json"
     generate_json(sessions, json_path, args.timezone)
     log.info("  JSON report:  %s", json_path)
+
+    # Lightweight sidecar for the dashboard (avoids loading the full JSON
+    # just to render the index or pre-filter search by username).
+    summary_path = os.path.splitext(excel_path)[0] + ".summary.json"
+    generate_summary_sidecar(
+        sessions, summary_path, report_date,
+        has_csv=os.path.exists(csv_path),
+        has_xlsx=os.path.exists(excel_path),
+    )
+    log.info("  Summary:      %s", summary_path)
 
     # Upload to file share if enabled (skip on --no-upload)
     upload_status = "disabled"

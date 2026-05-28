@@ -164,42 +164,72 @@ def _load_json_report(date_str):
     return None
 
 
-def _list_available_reports():
-    """List all available report dates with session counts."""
+_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def _index_reports_dir():
+    """Bucket the reports directory into per-date file maps.
+
+    Returns three dicts keyed by date string (YYYY-MM-DD):
+      - summaries: date -> filename of `*.summary.json` (the sidecar)
+      - full_jsons: date -> filename of the full report `*.json`
+      - csvs: set of dates that also have a `.csv` file
+
+    Single os.listdir call shared by both list and search routes.
+    """
     reports_dir = _get_reports_dir()
+    summaries = {}
+    full_jsons = {}
+    csvs = set()
     if not os.path.isdir(reports_dir):
+        return reports_dir, summaries, full_jsons, csvs
+    for fname in os.listdir(reports_dir):
+        m = _DATE_RE.search(fname)
+        if not m:
+            continue
+        d = m.group(1)
+        if fname.endswith(".summary.json"):
+            summaries[d] = fname
+        elif fname.endswith(".json"):
+            full_jsons[d] = fname
+        elif fname.endswith(".csv"):
+            csvs.add(d)
+    return reports_dir, summaries, full_jsons, csvs
+
+
+def _list_available_reports():
+    """List all available report dates with session counts.
+
+    Reads the sidecar `{date}.summary.json` (a few KB per report) instead of
+    parsing the full report JSON (which can be hundreds of MB at scale). When
+    a sidecar is missing (legacy reports generated before this feature) the
+    code falls back to loading the full JSON for that date only — running
+    `zpa-siem-ctl reindex` materialises the missing sidecars.
+    """
+    reports_dir, summaries, full_jsons, csvs = _index_reports_dir()
+    if not reports_dir or (not summaries and not full_jsons):
         return []
 
     reports = []
-    date_pattern = re.compile(r"(\d{4}-\d{2}-\d{2})")
-    seen_dates = set()
-
-    for filename in sorted(os.listdir(reports_dir), reverse=True):
-        if not filename.endswith(".json"):
-            continue
-        match = date_pattern.search(filename)
-        if not match:
-            continue
-        date_str = match.group(1)
-        if date_str in seen_dates:
-            continue
-        seen_dates.add(date_str)
-
-        path = os.path.join(reports_dir, filename)
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            session_count = len(data.get("sessions", []))
-        except (json.JSONDecodeError, OSError):
-            session_count = 0
-
-        has_csv = any(
-            f.endswith(".csv") and date_str in f
-            for f in os.listdir(reports_dir)
-        )
-        reports.append({"date": date_str, "session_count": session_count, "has_csv": has_csv})
-
-    reports.sort(key=lambda r: r["date"], reverse=True)
+    for d in sorted(set(summaries) | set(full_jsons), reverse=True):
+        session_count = 0
+        has_csv = d in csvs
+        if d in summaries:
+            try:
+                with open(os.path.join(reports_dir, summaries[d])) as f:
+                    s = json.load(f)
+                session_count = s.get("session_count", 0)
+                has_csv = s.get("has_csv", has_csv)
+            except (json.JSONDecodeError, OSError):
+                pass  # fall through to full JSON below
+        if session_count == 0 and d in full_jsons:
+            try:
+                with open(os.path.join(reports_dir, full_jsons[d])) as f:
+                    data = json.load(f)
+                session_count = len(data.get("sessions", []))
+            except (json.JSONDecodeError, OSError):
+                session_count = 0
+        reports.append({"date": d, "session_count": session_count, "has_csv": has_csv})
     return reports
 
 
@@ -411,27 +441,36 @@ def search():
     if not query:
         return render_template("search.html", query=None, results=None)
 
-    reports_dir = _get_reports_dir()
+    q_lower = query.lower()
+    reports_dir, summaries, full_jsons, _ = _index_reports_dir()
     results = []
 
-    if os.path.isdir(reports_dir):
-        for filename in sorted(os.listdir(reports_dir), reverse=True):
-            if not filename.endswith(".json"):
+    if reports_dir:
+        for d in sorted(set(summaries) | set(full_jsons), reverse=True):
+            # When a sidecar exists, use its usernames index to skip dates
+            # that cannot match — avoids loading the full JSON for those.
+            if d in summaries:
+                try:
+                    with open(os.path.join(reports_dir, summaries[d])) as f:
+                        s = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    s = None
+                if s is not None and not any(
+                    q_lower in u.lower() for u in s.get("usernames", [])
+                ):
+                    continue
+            if d not in full_jsons:
                 continue
-            path = os.path.join(reports_dir, filename)
             try:
-                with open(path) as f:
+                with open(os.path.join(reports_dir, full_jsons[d])) as f:
                     data = json.load(f)
             except (json.JSONDecodeError, OSError):
                 continue
+            for sess in data.get("sessions", []):
+                if q_lower in sess.get("username", "").lower():
+                    results.append(sess)
 
-            for s in data.get("sessions", []):
-                if query.lower() in s.get("username", "").lower():
-                    results.append(s)
-
-    # Sort by date desc, then session start
     results.sort(key=lambda s: (s.get("date", ""), s.get("session_start", "")), reverse=True)
-
     return render_template("search.html", query=query, results=results)
 
 
